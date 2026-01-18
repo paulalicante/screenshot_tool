@@ -54,6 +54,87 @@ except ImportError:
     import pygetwindow as gw
 
 
+class DelayCountdown:
+    """Shows a countdown timer before capturing"""
+
+    def __init__(self, seconds, callback):
+        self.seconds_left = seconds
+        self.callback = callback
+
+        # Create small floating window
+        self.window = tk.Toplevel()
+        self.window.title("Countdown")
+        self.window.attributes('-topmost', True)
+        self.window.overrideredirect(True)  # No window decorations
+
+        # Position in top-right corner of screen
+        screen_w = self.window.winfo_screenwidth()
+        self.window.geometry(f"150x80+{screen_w - 170}+20")
+
+        # Style the window
+        self.window.configure(bg='#333333')
+
+        # Countdown label
+        self.label = tk.Label(
+            self.window,
+            text=str(self.seconds_left),
+            font=("Arial", 36, "bold"),
+            fg="white",
+            bg='#333333'
+        )
+        self.label.pack(expand=True)
+
+        # Info label
+        self.info_label = tk.Label(
+            self.window,
+            text="Set up your screen...",
+            font=("Arial", 9),
+            fg="#aaaaaa",
+            bg='#333333'
+        )
+        self.info_label.pack()
+
+        # Cancel button (small)
+        cancel_btn = tk.Button(
+            self.window,
+            text="Cancel",
+            command=self.cancel,
+            font=("Arial", 8),
+            bg='#555555',
+            fg='white',
+            relief=tk.FLAT,
+            cursor='hand2'
+        )
+        cancel_btn.pack(pady=5)
+
+        # Bind Escape to cancel
+        self.window.bind('<Escape>', lambda e: self.cancel())
+
+        # Start countdown
+        self.tick()
+
+    def tick(self):
+        if self.seconds_left <= 0:
+            self.window.destroy()
+            self.callback(True)  # Capture now
+            return
+
+        self.label.config(text=str(self.seconds_left))
+
+        # Change color as countdown progresses
+        if self.seconds_left <= 2:
+            self.label.config(fg='#ff5555')  # Red for last 2 seconds
+        elif self.seconds_left <= 3:
+            self.label.config(fg='#ffaa00')  # Orange
+
+        self.seconds_left -= 1
+        self.window.after(1000, self.tick)
+
+    def cancel(self):
+        self.window.destroy()
+        self.callback(False)  # Cancelled
+
+
 class RegionSelector:
     """Fullscreen overlay for selecting a screen region"""
 
@@ -587,6 +668,19 @@ class ScreenshotTool:
         )
         refresh_btn.pack(side=tk.LEFT)
 
+        # Delay timer selector
+        ttk.Label(control_frame, text="  Delay:").pack(side=tk.LEFT, padx=(10, 2))
+        self.delay_var = tk.StringVar(value="0")
+        delay_combo = ttk.Combobox(
+            control_frame,
+            textvariable=self.delay_var,
+            values=["0", "3", "5", "10"],
+            width=3,
+            state="readonly"
+        )
+        delay_combo.pack(side=tk.LEFT)
+        ttk.Label(control_frame, text="sec").pack(side=tk.LEFT, padx=(2, 0))
+
         # Auto-paste to Claude option
         claude_frame = ttk.Frame(main_frame)
         claude_frame.pack(fill=tk.X, pady=(0, 10))
@@ -688,14 +782,27 @@ class ScreenshotTool:
 
     def start_region_capture(self):
         """Start the region selection process"""
-        self.status_var.set("Select a region...")
-        self.root.update()
+        delay = int(self.delay_var.get())
 
-        # Minimize main window so it's not in the way
-        self.root.iconify()
+        if delay > 0:
+            # Start countdown, then capture region
+            self.status_var.set(f"Countdown: {delay} seconds - set up your screen!")
+            self.root.iconify()
+            self.root.after(200, lambda: DelayCountdown(delay, self._on_region_delay_complete))
+        else:
+            # No delay - capture immediately
+            self.status_var.set("Select a region...")
+            self.root.update()
+            self.root.iconify()
+            self.root.after(200, self._show_region_selector)
 
-        # Small delay to let window minimize
-        self.root.after(200, self._show_region_selector)
+    def _on_region_delay_complete(self, proceed):
+        """Called when region delay countdown finishes"""
+        if proceed:
+            self._show_region_selector()
+        else:
+            self.root.deiconify()
+            self.status_var.set("Capture cancelled")
 
     def _show_region_selector(self):
         """Show the region selector overlay"""
@@ -741,6 +848,27 @@ class ScreenshotTool:
 
     def capture_fullscreen(self):
         """Capture the entire screen"""
+        delay = int(self.delay_var.get())
+
+        if delay > 0:
+            # Start countdown, then capture
+            self.status_var.set(f"Countdown: {delay} seconds - set up your screen!")
+            self.root.iconify()
+            self.root.after(200, lambda: DelayCountdown(delay, self._on_fullscreen_delay_complete))
+        else:
+            # No delay - capture immediately
+            self._do_fullscreen_capture()
+
+    def _on_fullscreen_delay_complete(self, proceed):
+        """Called when fullscreen delay countdown finishes"""
+        if proceed:
+            self._do_fullscreen_capture()
+        else:
+            self.root.deiconify()
+            self.status_var.set("Capture cancelled")
+
+    def _do_fullscreen_capture(self):
+        """Actually capture the fullscreen"""
         try:
             self.status_var.set("Capturing...")
             self.root.update()
@@ -754,11 +882,15 @@ class ScreenshotTool:
                 screenshot = sct.grab(sct.monitors[0])  # Monitor 0 = all monitors combined
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
+            # Restore window before opening editor
+            self.root.deiconify()
+
             # Open editor for highlighting before saving
             self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
             ScreenshotEditor(img, self.on_editor_complete)
 
         except Exception as e:
+            self.root.deiconify()
             error_msg = f"Error capturing screenshot: {e}"
             self.status_var.set(error_msg)
             print(error_msg)
