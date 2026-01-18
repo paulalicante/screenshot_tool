@@ -679,7 +679,7 @@ class ScreenshotEditor:
 class ScreenshotTool:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Screenshot Tool v1.01")
+        self.root.title("Screenshot Tool v1.04")
         self.root.geometry("600x550")
         self.root.minsize(400, 350)
 
@@ -723,15 +723,31 @@ class ScreenshotTool:
         # Initialize settings variables (needed for settings dialog)
         self.capture_mode_var = tk.StringVar(value="Region")
         self.delay_var = tk.StringVar(value="0")
+        self.thumbnail_scale = tk.IntVar(value=5)  # 1-10, 5 = current size (120x90)
+        self.disk_limit_mb = tk.IntVar(value=500)  # Max disk space in MB
+        self.archive_days = tk.IntVar(value=30)  # Days before suggesting cleanup
 
         # Top bar - Hotkey reminder and settings button
         top_frame = ttk.Frame(main_frame)
         top_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Hotkey reminder label
-        hotkey_text = "Ctrl+Shift+R: Region  |  Ctrl+Shift+S: Screen  |  Ctrl+Shift+W: Window"
-        hotkey_label = ttk.Label(top_frame, text=hotkey_text, font=("", 9))
-        hotkey_label.pack(side=tk.LEFT)
+        # Hotkey buttons - show shortcuts and act as clickable triggers
+        hotkey_frame = ttk.Frame(top_frame)
+        hotkey_frame.pack(side=tk.LEFT)
+
+        btn_style = {"width": 18}
+        ttk.Button(
+            hotkey_frame, text="Ctrl+Shift+R: Region",
+            command=self.start_region_capture, **btn_style
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(
+            hotkey_frame, text="Ctrl+Shift+S: Screen",
+            command=self.capture_fullscreen, **btn_style
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(
+            hotkey_frame, text="Ctrl+Shift+W: Window",
+            command=self.start_window_capture, **btn_style
+        ).pack(side=tk.LEFT)
 
         # Settings button (gear icon using unicode)
         settings_btn = ttk.Button(
@@ -741,6 +757,11 @@ class ScreenshotTool:
             width=10
         )
         settings_btn.pack(side=tk.RIGHT)
+
+        # Disk usage indicator (to the left of Settings)
+        self.disk_usage_var = tk.StringVar(value="")
+        self.disk_label = tk.Label(top_frame, textvariable=self.disk_usage_var, font=("", 8), fg="gray")
+        self.disk_label.pack(side=tk.RIGHT, padx=(0, 10))
 
         # Status label
         self.status_var = tk.StringVar(value="Ready")
@@ -1168,7 +1189,120 @@ class ScreenshotTool:
         self.root.configure(bg="green")
         self.root.after(100, lambda: self.root.configure(bg=original_bg))
 
+    def get_thumbnail_size(self):
+        """Calculate thumbnail size based on scale (1-10)"""
+        scale = self.thumbnail_scale.get()
+        base_width, base_height = 120, 90  # Default size at scale 5
+
+        # Scale 1 = 50% (0.5x), Scale 5 = 100% (1.0x), Scale 10 = 300% (3.0x)
+        if scale <= 5:
+            factor = 0.5 + (scale - 1) * 0.5 / 4
+        else:
+            factor = 1.0 + (scale - 5) * 2.0 / 5
+
+        return (int(base_width * factor), int(base_height * factor))
+
+    def update_disk_usage(self, show_warning=True):
+        """Calculate and display total size of screenshots with color coding"""
+        try:
+            total_bytes = sum(f.stat().st_size for f in self.save_dir.glob("screenshot_*.png"))
+            limit_bytes = self.disk_limit_mb.get() * 1024 * 1024
+            usage_percent = (total_bytes / limit_bytes * 100) if limit_bytes > 0 else 0
+
+            # Format size nicely
+            if total_bytes < 1024:
+                size_str = f"{total_bytes} B"
+            elif total_bytes < 1024 * 1024:
+                size_str = f"{total_bytes / 1024:.1f} KB"
+            elif total_bytes < 1024 * 1024 * 1024:
+                size_str = f"{total_bytes / (1024 * 1024):.1f} MB"
+            else:
+                size_str = f"{total_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+            # Show usage with percentage
+            limit_mb = self.disk_limit_mb.get()
+            self.disk_usage_var.set(f"📁 {size_str} / {limit_mb} MB")
+
+            # Color based on usage percentage
+            if usage_percent < 50:
+                color = "#228B22"  # Forest green
+            elif usage_percent < 70:
+                color = "#DAA520"  # Goldenrod (yellow-orange)
+            elif usage_percent < 90:
+                color = "#FF8C00"  # Dark orange
+            else:
+                color = "#DC143C"  # Crimson red
+
+            self.disk_label.config(fg=color)
+
+            # Show cleanup prompt at 90% (only once per session or when triggered)
+            if show_warning and usage_percent >= 90 and not getattr(self, '_cleanup_prompted', False):
+                self._cleanup_prompted = True
+                self.root.after(500, self.prompt_cleanup)
+
+        except:
+            self.disk_usage_var.set("")
+
+    def prompt_cleanup(self):
+        """Prompt user to clean up old screenshots"""
+        days = self.archive_days.get()
+        result = messagebox.askyesno(
+            "Disk Space Warning",
+            f"Screenshot storage is over 90% of limit.\n\n"
+            f"Would you like to delete screenshots older than {days} days?",
+            icon="warning"
+        )
+        if result:
+            self.cleanup_old_screenshots()
+
+    def cleanup_old_screenshots(self):
+        """Delete screenshots older than archive_days setting"""
+        import datetime
+        days = self.archive_days.get()
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+        deleted_count = 0
+        deleted_bytes = 0
+
+        try:
+            for f in self.save_dir.glob("screenshot_*.png"):
+                file_time = datetime.datetime.fromtimestamp(f.stat().st_mtime)
+                if file_time < cutoff:
+                    deleted_bytes += f.stat().st_size
+                    f.unlink()
+                    deleted_count += 1
+
+            if deleted_count > 0:
+                size_mb = deleted_bytes / (1024 * 1024)
+                messagebox.showinfo(
+                    "Cleanup Complete",
+                    f"Deleted {deleted_count} screenshot(s)\n"
+                    f"Freed {size_mb:.1f} MB of space"
+                )
+                self._cleanup_prompted = False  # Allow future prompts
+                self.refresh_gallery()
+            else:
+                messagebox.showinfo(
+                    "Cleanup Complete",
+                    f"No screenshots older than {days} days found."
+                )
+        except Exception as e:
+            messagebox.showerror("Error", f"Cleanup failed: {e}")
+
+    def manual_cleanup(self):
+        """Manually trigger cleanup with confirmation"""
+        days = self.archive_days.get()
+        result = messagebox.askyesno(
+            "Confirm Cleanup",
+            f"Delete all screenshots older than {days} days?",
+            icon="question"
+        )
+        if result:
+            self.cleanup_old_screenshots()
+
     def refresh_gallery(self):
+        # Update disk usage display
+        self.update_disk_usage()
+
         # Clear existing thumbnails
         for widget in self.gallery_frame.winfo_children():
             widget.destroy()
@@ -1195,10 +1329,15 @@ class ScreenshotTool:
         # Store references to prevent garbage collection
         self.thumbnail_images = []
 
+        # Calculate thumbnails per row based on size
+        thumb_width = self.get_thumbnail_size()[0]
+        gallery_width = 560  # Approximate usable width
+        thumbs_per_row = max(1, gallery_width // (thumb_width + 15))
+
         # Create thumbnail grid
         row_frame = None
         for i, screenshot_path in enumerate(screenshots):
-            if i % 4 == 0:  # 4 thumbnails per row
+            if i % thumbs_per_row == 0:
                 row_frame = ttk.Frame(self.gallery_frame)
                 row_frame.pack(fill=tk.X, pady=5)
 
@@ -1207,9 +1346,10 @@ class ScreenshotTool:
                 thumb_frame = tk.Frame(row_frame, bg='white')
                 thumb_frame.pack(side=tk.LEFT, padx=5)
 
-                # Load and resize image
+                # Load and resize image based on thumbnail scale
                 img = Image.open(screenshot_path)
-                img.thumbnail((120, 90), Image.Resampling.LANCZOS)
+                thumb_size = self.get_thumbnail_size()
+                img.thumbnail(thumb_size, Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 self.thumbnail_images.append(photo)
 
@@ -1324,7 +1464,7 @@ class ScreenshotTool:
         settings_win.resizable(False, False)
 
         # Center on parent
-        settings_win.geometry("350x320")
+        settings_win.geometry("350x520")
         settings_win.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() - settings_win.winfo_width()) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - settings_win.winfo_height()) // 2
@@ -1381,6 +1521,71 @@ class ScreenshotTool:
             variable=self.auto_paste_claude
         )
         paste_check.pack(anchor=tk.W, pady=2)
+
+        # Thumbnail size slider
+        thumb_frame = ttk.Frame(frame)
+        thumb_frame.pack(fill=tk.X, pady=(0, 15))
+        ttk.Label(thumb_frame, text="Preview Size:", width=15).pack(side=tk.LEFT)
+
+        # Show current size label
+        size_label = ttk.Label(thumb_frame, text="", width=10)
+
+        def update_size_label(*args):
+            w, h = self.get_thumbnail_size()
+            size_label.config(text=f"{w}x{h}")
+
+        thumb_slider = ttk.Scale(
+            thumb_frame,
+            from_=1,
+            to=10,
+            variable=self.thumbnail_scale,
+            orient=tk.HORIZONTAL,
+            length=120,
+            command=update_size_label  # Just update label while dragging
+        )
+        thumb_slider.pack(side=tk.LEFT, padx=(10, 5))
+        # Refresh gallery only when slider is released
+        thumb_slider.bind("<ButtonRelease-1>", lambda e: self.refresh_gallery())
+        size_label.pack(side=tk.LEFT)
+        update_size_label()
+
+        # Storage management section
+        storage_frame = ttk.LabelFrame(frame, text="Storage Management", padding="10")
+        storage_frame.pack(fill=tk.X, pady=(0, 15))
+
+        # Disk limit
+        limit_frame = ttk.Frame(storage_frame)
+        limit_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(limit_frame, text="Disk Limit (MB):", width=15).pack(side=tk.LEFT)
+        limit_combo = ttk.Combobox(
+            limit_frame,
+            textvariable=self.disk_limit_mb,
+            values=["100", "250", "500", "1000", "2000", "5000"],
+            width=10
+        )
+        limit_combo.pack(side=tk.LEFT, padx=(10, 0))
+        limit_combo.bind("<<ComboboxSelected>>", lambda e: self.update_disk_usage(show_warning=False))
+
+        # Archive days
+        archive_frame = ttk.Frame(storage_frame)
+        archive_frame.pack(fill=tk.X, pady=(5, 5))
+        ttk.Label(archive_frame, text="Auto-cleanup age:", width=15).pack(side=tk.LEFT)
+        archive_combo = ttk.Combobox(
+            archive_frame,
+            textvariable=self.archive_days,
+            values=["7", "14", "30", "60", "90"],
+            width=10
+        )
+        archive_combo.pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(archive_frame, text="days").pack(side=tk.LEFT, padx=(5, 0))
+
+        # Manual cleanup button
+        cleanup_btn = ttk.Button(
+            storage_frame,
+            text="Clean Up Now",
+            command=self.manual_cleanup
+        )
+        cleanup_btn.pack(pady=(5, 0))
 
         # Save location
         loc_frame = ttk.LabelFrame(frame, text="Save Location", padding="10")
