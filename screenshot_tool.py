@@ -680,6 +680,7 @@ class ScreenshotTool:
         # Hotkey configuration
         self.hotkey_full = "ctrl+shift+s"
         self.hotkey_region = "ctrl+shift+r"
+        self.hotkey_window = "ctrl+shift+w"
         self.hotkeys_registered = False
 
         # Screenshot counter for this session
@@ -708,99 +709,32 @@ class ScreenshotTool:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Top section - Controls
-        control_frame = ttk.Frame(main_frame)
-        control_frame.pack(fill=tk.X, pady=(0, 10))
-
-        # Capture mode dropdown
-        ttk.Label(control_frame, text="Mode:").pack(side=tk.LEFT, padx=(0, 5))
+        # Initialize settings variables (needed for settings dialog)
         self.capture_mode_var = tk.StringVar(value="Region")
-        mode_combo = ttk.Combobox(
-            control_frame,
-            textvariable=self.capture_mode_var,
-            values=["Region", "Window", "Full Screen"],
-            width=12,
-            state="readonly"
-        )
-        mode_combo.pack(side=tk.LEFT, padx=(0, 10))
-
-        # Capture button
-        self.capture_btn = ttk.Button(
-            control_frame,
-            text="Capture",
-            command=self.do_capture
-        )
-        self.capture_btn.pack(side=tk.LEFT, padx=(0, 10))
-
-        # Delay timer selector
-        ttk.Label(control_frame, text="Delay:").pack(side=tk.LEFT, padx=(5, 2))
         self.delay_var = tk.StringVar(value="0")
-        delay_combo = ttk.Combobox(
-            control_frame,
-            textvariable=self.delay_var,
-            values=["0", "3", "5", "10"],
-            width=3,
-            state="readonly"
-        )
-        delay_combo.pack(side=tk.LEFT)
-        ttk.Label(control_frame, text="sec").pack(side=tk.LEFT, padx=(2, 10))
 
-        # Open folder button
-        open_folder_btn = ttk.Button(
-            control_frame,
-            text="Open Folder",
-            command=self.open_save_folder
-        )
-        open_folder_btn.pack(side=tk.LEFT, padx=(0, 5))
+        # Top bar - Hotkey reminder and settings button
+        top_frame = ttk.Frame(main_frame)
+        top_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Refresh button
-        refresh_btn = ttk.Button(
-            control_frame,
-            text="Refresh",
-            command=self.refresh_gallery
-        )
-        refresh_btn.pack(side=tk.LEFT)
+        # Hotkey reminder label
+        hotkey_text = "Ctrl+Shift+R: Region  |  Ctrl+Shift+S: Screen  |  Ctrl+Shift+W: Window"
+        hotkey_label = ttk.Label(top_frame, text=hotkey_text, font=("", 9))
+        hotkey_label.pack(side=tk.LEFT)
 
-        # Options row
-        options_frame = ttk.Frame(main_frame)
-        options_frame.pack(fill=tk.X, pady=(0, 10))
-
-        # Edit before save option
-        self.edit_check = ttk.Checkbutton(
-            options_frame,
-            text="Edit before save",
-            variable=self.edit_before_save
+        # Settings button (gear icon using unicode)
+        settings_btn = ttk.Button(
+            top_frame,
+            text="\u2699 Settings",
+            command=self.show_settings,
+            width=10
         )
-        self.edit_check.pack(side=tk.LEFT, padx=(0, 20))
-
-        # Auto-paste to Claude option
-        self.auto_paste_check = ttk.Checkbutton(
-            options_frame,
-            text="Auto-paste to VSCode Claude",
-            variable=self.auto_paste_claude
-        )
-        self.auto_paste_check.pack(side=tk.LEFT)
+        settings_btn.pack(side=tk.RIGHT)
 
         # Status label
-        self.status_var = tk.StringVar(value="Ready - Select mode and click Capture (or use Ctrl+Shift+R / Ctrl+Shift+S)")
-        status_label = ttk.Label(main_frame, textvariable=self.status_var)
-        status_label.pack(fill=tk.X, pady=(0, 10))
-
-        # Save directory info
-        dir_frame = ttk.Frame(main_frame)
-        dir_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Label(dir_frame, text="Save Location:").pack(side=tk.LEFT)
-        self.dir_var = tk.StringVar(value=str(self.save_dir))
-        dir_entry = ttk.Entry(dir_frame, textvariable=self.dir_var, state="readonly")
-        dir_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
-
-        change_dir_btn = ttk.Button(
-            dir_frame,
-            text="Change",
-            command=self.change_save_dir
-        )
-        change_dir_btn.pack(side=tk.RIGHT)
+        self.status_var = tk.StringVar(value="Ready")
+        status_label = ttk.Label(main_frame, textvariable=self.status_var, foreground="gray")
+        status_label.pack(fill=tk.X, pady=(0, 5))
 
         # Gallery section
         gallery_label = ttk.Label(main_frame, text="Recent Screenshots:", font=("", 10, "bold"))
@@ -847,10 +781,12 @@ class ScreenshotTool:
         try:
             keyboard.add_hotkey(self.hotkey_full, self.capture_fullscreen_threadsafe)
             keyboard.add_hotkey(self.hotkey_region, self.start_region_capture_threadsafe)
+            keyboard.add_hotkey(self.hotkey_window, self.start_window_capture_threadsafe)
             self.hotkeys_registered = True
             print(f"Global hotkeys registered:")
-            print(f"  {self.hotkey_full} - Full screen capture")
             print(f"  {self.hotkey_region} - Region capture")
+            print(f"  {self.hotkey_full} - Full screen capture")
+            print(f"  {self.hotkey_window} - Window capture")
         except Exception as e:
             print(f"Failed to register hotkeys: {e}")
             self.status_var.set(f"Warning: Could not register global hotkeys - {e}")
@@ -860,8 +796,12 @@ class ScreenshotTool:
             try:
                 keyboard.remove_hotkey(self.hotkey_full)
                 keyboard.remove_hotkey(self.hotkey_region)
+                keyboard.remove_hotkey(self.hotkey_window)
             except:
                 pass
+
+    def start_window_capture_threadsafe(self):
+        self.root.after(0, self.start_window_capture)
 
     def capture_fullscreen_threadsafe(self):
         self.root.after(0, self.capture_fullscreen)
@@ -1348,6 +1288,88 @@ class ScreenshotTool:
             os.startfile(str(self.save_dir))
         except Exception as e:
             messagebox.showerror("Error", f"Could not open folder: {e}")
+
+    def show_settings(self):
+        """Show the settings dialog"""
+        settings_win = tk.Toplevel(self.root)
+        settings_win.title("Settings")
+        settings_win.transient(self.root)
+        settings_win.resizable(False, False)
+
+        # Center on parent
+        settings_win.geometry("350x320")
+        settings_win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - settings_win.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - settings_win.winfo_height()) // 2
+        settings_win.geometry(f"+{x}+{y}")
+
+        # Main container with padding
+        frame = ttk.Frame(settings_win, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Capture Mode
+        mode_frame = ttk.Frame(frame)
+        mode_frame.pack(fill=tk.X, pady=(0, 15))
+        ttk.Label(mode_frame, text="Capture Mode:", width=15).pack(side=tk.LEFT)
+        mode_combo = ttk.Combobox(
+            mode_frame,
+            textvariable=self.capture_mode_var,
+            values=["Region", "Window", "Full Screen"],
+            state="readonly",
+            width=15
+        )
+        mode_combo.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Capture button for manual capture
+        capture_btn = ttk.Button(mode_frame, text="Capture", command=self.do_capture, width=8)
+        capture_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Delay
+        delay_frame = ttk.Frame(frame)
+        delay_frame.pack(fill=tk.X, pady=(0, 15))
+        ttk.Label(delay_frame, text="Delay (seconds):", width=15).pack(side=tk.LEFT)
+        delay_combo = ttk.Combobox(
+            delay_frame,
+            textvariable=self.delay_var,
+            values=["0", "3", "5", "10"],
+            state="readonly",
+            width=15
+        )
+        delay_combo.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Checkboxes
+        check_frame = ttk.Frame(frame)
+        check_frame.pack(fill=tk.X, pady=(0, 15))
+
+        edit_check = ttk.Checkbutton(
+            check_frame,
+            text="Edit before save (open editor after capture)",
+            variable=self.edit_before_save
+        )
+        edit_check.pack(anchor=tk.W, pady=2)
+
+        paste_check = ttk.Checkbutton(
+            check_frame,
+            text="Auto-paste to VSCode Claude",
+            variable=self.auto_paste_claude
+        )
+        paste_check.pack(anchor=tk.W, pady=2)
+
+        # Save location
+        loc_frame = ttk.LabelFrame(frame, text="Save Location", padding="10")
+        loc_frame.pack(fill=tk.X, pady=(0, 15))
+
+        self.dir_var = tk.StringVar(value=str(self.save_dir))
+        dir_label = ttk.Label(loc_frame, textvariable=self.dir_var, wraplength=280)
+        dir_label.pack(fill=tk.X, pady=(0, 10))
+
+        btn_frame = ttk.Frame(loc_frame)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="Change...", command=self.change_save_dir).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(btn_frame, text="Open Folder", command=self.open_save_folder).pack(side=tk.LEFT)
+
+        # Close button
+        ttk.Button(frame, text="Close", command=settings_win.destroy).pack(pady=(10, 0))
 
     def change_save_dir(self):
         """Change the save directory"""
