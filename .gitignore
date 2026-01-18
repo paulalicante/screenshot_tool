@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Flutter (legacy - not used, this is a Python project)
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.metadata
+pubspec.lock
+lib/
+test/
+windows/
+android/
+ios/
+linux/
+macos/
+web/
+
+# Build artifacts
+build/
+cmake_test/
+*.log
+
+# Temporary/log files
+*.tmp
+*.bak
+*~
+build_*.txt
+cmake_*.txt
+*.cmd
+!run_screenshot_tool.bat
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc legacy files
+analysis_options.yaml
+pubspec.yaml
+*.iml
+HOW_TO_TEST.txt
+QUICKSTART.md
+run.bat
+build.ps1
+build_final.ps1
+quick_build.cmd
+run_build.cmd
+build_final.cmd
+test_cmake.cmd
+build_and_run.bat
+.claude/
