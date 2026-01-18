@@ -688,6 +688,9 @@ class ScreenshotTool:
         # Auto-paste to Claude setting
         self.auto_paste_claude = tk.BooleanVar(value=False)
 
+        # Edit before save setting (default: True - show editor)
+        self.edit_before_save = tk.BooleanVar(value=True)
+
         # Build the UI
         self.setup_ui()
 
@@ -758,13 +761,22 @@ class ScreenshotTool:
         )
         refresh_btn.pack(side=tk.LEFT)
 
-        # Auto-paste to Claude option
-        claude_frame = ttk.Frame(main_frame)
-        claude_frame.pack(fill=tk.X, pady=(0, 10))
+        # Options row
+        options_frame = ttk.Frame(main_frame)
+        options_frame.pack(fill=tk.X, pady=(0, 10))
 
+        # Edit before save option
+        self.edit_check = ttk.Checkbutton(
+            options_frame,
+            text="Edit before save",
+            variable=self.edit_before_save
+        )
+        self.edit_check.pack(side=tk.LEFT, padx=(0, 20))
+
+        # Auto-paste to Claude option
         self.auto_paste_check = ttk.Checkbutton(
-            claude_frame,
-            text="Auto-paste to VSCode Claude after capture",
+            options_frame,
+            text="Auto-paste to VSCode Claude",
             variable=self.auto_paste_claude
         )
         self.auto_paste_check.pack(side=tk.LEFT)
@@ -936,9 +948,12 @@ class ScreenshotTool:
                 screenshot = sct.grab(monitor)
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
-            # Open editor
-            self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
-            ScreenshotEditor(img, self.on_editor_complete)
+            # Open editor or save directly
+            if self.edit_before_save.get():
+                self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
+                ScreenshotEditor(img, self.on_editor_complete)
+            else:
+                self.save_screenshot(img)
 
         except Exception as e:
             error_msg = f"Error capturing window: {e}"
@@ -1002,9 +1017,12 @@ class ScreenshotTool:
                 screenshot = sct.grab(monitor)
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
-            # Open editor for highlighting before saving
-            self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
-            ScreenshotEditor(img, self.on_editor_complete)
+            # Open editor or save directly
+            if self.edit_before_save.get():
+                self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
+                ScreenshotEditor(img, self.on_editor_complete)
+            else:
+                self.save_screenshot(img)
 
         except Exception as e:
             error_msg = f"Error capturing region: {e}"
@@ -1048,12 +1066,15 @@ class ScreenshotTool:
                 screenshot = sct.grab(sct.monitors[0])  # Monitor 0 = all monitors combined
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
-            # Restore window before opening editor
+            # Restore window
             self.root.deiconify()
 
-            # Open editor for highlighting before saving
-            self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
-            ScreenshotEditor(img, self.on_editor_complete)
+            # Open editor or save directly
+            if self.edit_before_save.get():
+                self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
+                ScreenshotEditor(img, self.on_editor_complete)
+            else:
+                self.save_screenshot(img)
 
         except Exception as e:
             self.root.deiconify()
