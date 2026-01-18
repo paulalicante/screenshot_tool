@@ -140,11 +140,12 @@ class WindowSelector:
 
     def __init__(self, callback):
         self.callback = callback
+        self.handled = False  # Guard against multiple clicks
 
         # Create fullscreen semi-transparent overlay
         self.overlay = tk.Toplevel()
         self.overlay.attributes('-fullscreen', True)
-        self.overlay.attributes('-alpha', 0.01)  # Nearly invisible
+        self.overlay.attributes('-alpha', 0.15)  # Semi-transparent - enough to capture clicks
         self.overlay.attributes('-topmost', True)
         self.overlay.configure(bg='black')
 
@@ -171,18 +172,24 @@ class WindowSelector:
         self.overlay.bind('<Escape>', self.on_cancel)
         self.info_window.bind('<Escape>', self.on_cancel)
 
-        # Focus
+        # Focus the overlay to receive clicks
         self.overlay.focus_force()
+        self.overlay.lift()
 
     def on_click(self, event):
         """Get the window at click position"""
+        # Guard against multiple click events
+        if self.handled:
+            return
+        self.handled = True
+
         import win32gui
         import win32con
 
         # Get screen coordinates
         x, y = event.x_root, event.y_root
 
-        # Close our overlays first
+        # Close our overlays
         self.overlay.destroy()
         self.info_window.destroy()
 
@@ -203,6 +210,9 @@ class WindowSelector:
             self.callback(None)
 
     def on_cancel(self, event):
+        if self.handled:
+            return
+        self.handled = True
         self.overlay.destroy()
         self.info_window.destroy()
         self.callback(None)
@@ -669,7 +679,7 @@ class ScreenshotEditor:
 class ScreenshotTool:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Screenshot Tool")
+        self.root.title("Screenshot Tool v1.01")
         self.root.geometry("600x550")
         self.root.minsize(400, 350)
 
@@ -682,6 +692,7 @@ class ScreenshotTool:
         self.hotkey_region = "ctrl+shift+r"
         self.hotkey_window = "ctrl+shift+w"
         self.hotkeys_registered = False
+        self._capture_in_progress = False  # Prevent multiple simultaneous captures
 
         # Screenshot counter for this session
         self.screenshot_count = 0
@@ -801,12 +812,23 @@ class ScreenshotTool:
                 pass
 
     def start_window_capture_threadsafe(self):
-        self.root.after(0, self.start_window_capture)
+        # Prevent multiple hotkey triggers
+        if self._capture_in_progress:
+            return
+        self._capture_in_progress = True
+        # Delay to allow hotkey keys to be released before showing selector
+        self.root.after(150, self.start_window_capture)
 
     def capture_fullscreen_threadsafe(self):
+        if self._capture_in_progress:
+            return
+        self._capture_in_progress = True
         self.root.after(0, self.capture_fullscreen)
 
     def start_region_capture_threadsafe(self):
+        if self._capture_in_progress:
+            return
+        self._capture_in_progress = True
         self.root.after(0, self.start_region_capture)
 
     def do_capture(self):
@@ -847,6 +869,7 @@ class ScreenshotTool:
 
     def on_window_selected(self, hwnd):
         """Called when window selection is complete"""
+        self._capture_in_progress = False  # Reset flag
         self.root.deiconify()
 
         if hwnd is None:
@@ -931,6 +954,7 @@ class ScreenshotTool:
 
     def on_region_selected(self, region):
         """Called when region selection is complete"""
+        self._capture_in_progress = False  # Reset flag
         # Restore main window
         self.root.deiconify()
 
@@ -980,19 +1004,22 @@ class ScreenshotTool:
             self.root.iconify()
             self.root.after(200, lambda: DelayCountdown(delay, self._on_fullscreen_delay_complete))
         else:
-            # No delay - capture immediately
-            self._do_fullscreen_capture()
+            # No delay - hide window briefly then capture
+            self.root.iconify()
+            self.root.after(150, self._do_fullscreen_capture)
 
     def _on_fullscreen_delay_complete(self, proceed):
         """Called when fullscreen delay countdown finishes"""
         if proceed:
             self._do_fullscreen_capture()
         else:
+            self._capture_in_progress = False  # Reset flag
             self.root.deiconify()
             self.status_var.set("Capture cancelled")
 
     def _do_fullscreen_capture(self):
         """Actually capture the fullscreen"""
+        self._capture_in_progress = False  # Reset flag
         try:
             self.status_var.set("Capturing...")
             self.root.update()
