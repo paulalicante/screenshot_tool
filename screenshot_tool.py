@@ -967,6 +967,9 @@ class ScreenshotTool:
     def paste_to_vscode_claude(self):
         """Find VSCode window and paste the screenshot into Claude input"""
         try:
+            import win32gui
+            import win32con
+
             # Find VSCode window - look for windows with "Visual Studio Code" in title
             vscode_windows = [w for w in gw.getAllWindows()
                            if 'Visual Studio Code' in w.title or 'VSCode' in w.title]
@@ -979,34 +982,26 @@ class ScreenshotTool:
             # Get the first VSCode window
             vscode = vscode_windows[0]
 
-            # Activate the window
-            try:
-                vscode.activate()
-            except:
-                # Sometimes activate fails, try minimize/restore
-                vscode.minimize()
-                vscode.restore()
+            # Get the window handle for more reliable activation
+            hwnd = vscode._hWnd
 
-            # Wait for window to come to foreground
-            time.sleep(0.3)
+            # Restore if minimized
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
 
-            # Get window dimensions
-            left, top, width, height = vscode.left, vscode.top, vscode.width, vscode.height
+            # Bring window to foreground using Windows API (more reliable)
+            win32gui.SetForegroundWindow(hwnd)
 
-            # Click near the bottom center of the window where Claude input typically is
-            # The input box is usually at the very bottom, centered
-            click_x = left + (width // 2)
-            click_y = top + height - 60  # 60 pixels from bottom
+            # Brief wait for window to come to foreground
+            time.sleep(0.2)
 
-            # Click to focus the input area
-            pyautogui.click(click_x, click_y)
-            time.sleep(0.1)
-
-            # Paste the image
+            # Just paste - don't try to click anywhere
+            # The paste will go to whatever has focus in VSCode
+            # User should have Claude input focused (or it will paste to last focused area)
             pyautogui.hotkey('ctrl', 'v')
 
-            self.status_var.set(f"Pasted to VSCode Claude!")
-            print("Screenshot pasted to VSCode Claude")
+            self.status_var.set(f"Pasted to VSCode! (Make sure Claude input has focus)")
+            print("Screenshot pasted to VSCode")
 
         except Exception as e:
             error_msg = f"Auto-paste failed: {e}"
