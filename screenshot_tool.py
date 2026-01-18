@@ -135,6 +135,79 @@ class DelayCountdown:
         self.callback(False)  # Cancelled
 
 
+class WindowSelector:
+    """Overlay for selecting a window to capture"""
+
+    def __init__(self, callback):
+        self.callback = callback
+
+        # Create fullscreen semi-transparent overlay
+        self.overlay = tk.Toplevel()
+        self.overlay.attributes('-fullscreen', True)
+        self.overlay.attributes('-alpha', 0.01)  # Nearly invisible
+        self.overlay.attributes('-topmost', True)
+        self.overlay.configure(bg='black')
+
+        # Instructions window (separate small window)
+        self.info_window = tk.Toplevel()
+        self.info_window.attributes('-topmost', True)
+        self.info_window.overrideredirect(True)
+        self.info_window.configure(bg='#333333')
+
+        # Position info window at top center
+        screen_w = self.info_window.winfo_screenwidth()
+        self.info_window.geometry(f"350x50+{(screen_w - 350) // 2}+20")
+
+        tk.Label(
+            self.info_window,
+            text="Click on any window to capture it\nPress ESC to cancel",
+            font=("Arial", 11),
+            fg="white",
+            bg='#333333'
+        ).pack(expand=True)
+
+        # Bind click on overlay
+        self.overlay.bind('<Button-1>', self.on_click)
+        self.overlay.bind('<Escape>', self.on_cancel)
+        self.info_window.bind('<Escape>', self.on_cancel)
+
+        # Focus
+        self.overlay.focus_force()
+
+    def on_click(self, event):
+        """Get the window at click position"""
+        import win32gui
+        import win32con
+
+        # Get screen coordinates
+        x, y = event.x_root, event.y_root
+
+        # Close our overlays first
+        self.overlay.destroy()
+        self.info_window.destroy()
+
+        # Small delay to ensure overlay is gone
+        time.sleep(0.1)
+
+        # Get the window at this position
+        hwnd = win32gui.WindowFromPoint((x, y))
+
+        if hwnd:
+            # Get the top-level parent window
+            root_hwnd = win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
+            if root_hwnd:
+                hwnd = root_hwnd
+
+            self.callback(hwnd)
+        else:
+            self.callback(None)
+
+    def on_cancel(self, event):
+        self.overlay.destroy()
+        self.info_window.destroy()
+        self.callback(None)
+
+
 class RegionSelector:
     """Fullscreen overlay for selecting a screen region"""
 
@@ -636,40 +709,28 @@ class ScreenshotTool:
         control_frame = ttk.Frame(main_frame)
         control_frame.pack(fill=tk.X, pady=(0, 10))
 
-        # Region capture button (primary action)
-        self.region_btn = ttk.Button(
+        # Capture mode dropdown
+        ttk.Label(control_frame, text="Mode:").pack(side=tk.LEFT, padx=(0, 5))
+        self.capture_mode_var = tk.StringVar(value="Region")
+        mode_combo = ttk.Combobox(
             control_frame,
-            text="Capture Region (Ctrl+Shift+R)",
-            command=self.start_region_capture
+            textvariable=self.capture_mode_var,
+            values=["Region", "Window", "Full Screen"],
+            width=12,
+            state="readonly"
         )
-        self.region_btn.pack(side=tk.LEFT, padx=(0, 10))
+        mode_combo.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Full screen capture button
+        # Capture button
         self.capture_btn = ttk.Button(
             control_frame,
-            text="Full Screen (Ctrl+Shift+S)",
-            command=self.capture_fullscreen
+            text="Capture",
+            command=self.do_capture
         )
         self.capture_btn.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Open folder button
-        open_folder_btn = ttk.Button(
-            control_frame,
-            text="Open Folder",
-            command=self.open_save_folder
-        )
-        open_folder_btn.pack(side=tk.LEFT, padx=(0, 10))
-
-        # Refresh button
-        refresh_btn = ttk.Button(
-            control_frame,
-            text="Refresh",
-            command=self.refresh_gallery
-        )
-        refresh_btn.pack(side=tk.LEFT)
-
         # Delay timer selector
-        ttk.Label(control_frame, text="  Delay:").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(control_frame, text="Delay:").pack(side=tk.LEFT, padx=(5, 2))
         self.delay_var = tk.StringVar(value="0")
         delay_combo = ttk.Combobox(
             control_frame,
@@ -679,7 +740,23 @@ class ScreenshotTool:
             state="readonly"
         )
         delay_combo.pack(side=tk.LEFT)
-        ttk.Label(control_frame, text="sec").pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(control_frame, text="sec").pack(side=tk.LEFT, padx=(2, 10))
+
+        # Open folder button
+        open_folder_btn = ttk.Button(
+            control_frame,
+            text="Open Folder",
+            command=self.open_save_folder
+        )
+        open_folder_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        # Refresh button
+        refresh_btn = ttk.Button(
+            control_frame,
+            text="Refresh",
+            command=self.refresh_gallery
+        )
+        refresh_btn.pack(side=tk.LEFT)
 
         # Auto-paste to Claude option
         claude_frame = ttk.Frame(main_frame)
@@ -693,7 +770,7 @@ class ScreenshotTool:
         self.auto_paste_check.pack(side=tk.LEFT)
 
         # Status label
-        self.status_var = tk.StringVar(value="Ready - Press Ctrl+Shift+R for region, Ctrl+Shift+S for full screen")
+        self.status_var = tk.StringVar(value="Ready - Select mode and click Capture (or use Ctrl+Shift+R / Ctrl+Shift+S)")
         status_label = ttk.Label(main_frame, textvariable=self.status_var)
         status_label.pack(fill=tk.X, pady=(0, 10))
 
@@ -779,6 +856,95 @@ class ScreenshotTool:
 
     def start_region_capture_threadsafe(self):
         self.root.after(0, self.start_region_capture)
+
+    def do_capture(self):
+        """Dispatch capture based on selected mode"""
+        mode = self.capture_mode_var.get()
+        if mode == "Region":
+            self.start_region_capture()
+        elif mode == "Window":
+            self.start_window_capture()
+        elif mode == "Full Screen":
+            self.capture_fullscreen()
+
+    def start_window_capture(self):
+        """Start the window selection process"""
+        delay = int(self.delay_var.get())
+
+        if delay > 0:
+            self.status_var.set(f"Countdown: {delay} seconds - set up your screen!")
+            self.root.iconify()
+            self.root.after(200, lambda: DelayCountdown(delay, self._on_window_delay_complete))
+        else:
+            self.status_var.set("Click on a window to capture...")
+            self.root.update()
+            self.root.iconify()
+            self.root.after(200, self._show_window_selector)
+
+    def _on_window_delay_complete(self, proceed):
+        """Called when window delay countdown finishes"""
+        if proceed:
+            self._show_window_selector()
+        else:
+            self.root.deiconify()
+            self.status_var.set("Capture cancelled")
+
+    def _show_window_selector(self):
+        """Show the window selector overlay"""
+        WindowSelector(self.on_window_selected)
+
+    def on_window_selected(self, hwnd):
+        """Called when window selection is complete"""
+        self.root.deiconify()
+
+        if hwnd is None:
+            self.status_var.set("Window capture cancelled")
+            return
+
+        self.capture_window(hwnd)
+
+    def capture_window(self, hwnd):
+        """Capture a specific window by its handle"""
+        import win32gui
+        import win32ui
+        import win32con
+        from ctypes import windll
+
+        try:
+            self.status_var.set("Capturing window...")
+            self.root.update()
+
+            # Get window rectangle
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            width = right - left
+            height = bottom - top
+
+            if width <= 0 or height <= 0:
+                self.status_var.set("Invalid window dimensions")
+                return
+
+            # Bring window to front briefly to ensure it's visible
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+                time.sleep(0.1)
+            except:
+                pass
+
+            # Capture using mss (more reliable)
+            with mss.mss() as sct:
+                monitor = {"top": top, "left": left, "width": width, "height": height}
+                screenshot = sct.grab(monitor)
+                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+
+            # Open editor
+            self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
+            ScreenshotEditor(img, self.on_editor_complete)
+
+        except Exception as e:
+            error_msg = f"Error capturing window: {e}"
+            self.status_var.set(error_msg)
+            print(error_msg)
+            messagebox.showerror("Error", error_msg)
 
     def start_region_capture(self):
         """Start the region selection process"""
