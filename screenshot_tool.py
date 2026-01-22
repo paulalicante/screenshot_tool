@@ -17,6 +17,17 @@ from datetime import datetime
 from pathlib import Path
 import subprocess
 import time
+import traceback
+import logging
+
+# Set up crash logging
+log_dir = Path.home() / "Pictures" / "Screenshots"
+log_dir.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=log_dir / "screenshot_tool_crash.log",
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # Check and install required packages
 def install_package(package):
@@ -2884,9 +2895,32 @@ class ScreenshotTool:
         # Auto-open settings on startup so user can see current config
         self.root.after(100, self.show_settings)
 
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except Exception as e:
+            # Log runtime crashes
+            error_msg = f"RUNTIME CRASH: {str(e)}\n{traceback.format_exc()}"
+            logging.error(error_msg)
+            print(f"\n{'='*60}")
+            print("RUNTIME ERROR - Error logged to:")
+            print(f"{self.save_dir / 'screenshot_tool_crash.log'}")
+            print(f"{'='*60}")
+            print(error_msg)
+            raise
 
 
 if __name__ == "__main__":
-    app = ScreenshotTool()
-    app.run()
+    try:
+        app = ScreenshotTool()
+        app.run()
+    except Exception as e:
+        # Log the crash
+        error_msg = f"CRASH: {str(e)}\n{traceback.format_exc()}"
+        logging.error(error_msg)
+        print(f"\n{'='*60}")
+        print("APPLICATION CRASHED - Error logged to:")
+        print(f"{log_dir / 'screenshot_tool_crash.log'}")
+        print(f"{'='*60}")
+        print(error_msg)
+        input("\nPress Enter to exit...")
+        sys.exit(1)
