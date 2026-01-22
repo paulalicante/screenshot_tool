@@ -750,6 +750,9 @@ class ScreenshotTool:
         self.drag_label = None  # Floating label during drag
         self.folder_drop_targets = {}  # folder_name -> button widget
 
+        # Track all floating windows for cleanup
+        self.floating_windows = []
+
         # Build the UI
         self.setup_ui()
 
@@ -761,6 +764,9 @@ class ScreenshotTool:
 
         # Load existing screenshots
         self.refresh_gallery()
+
+        # Periodic cleanup of floating windows (every 5 seconds)
+        self.schedule_cleanup()
 
         # Handle window close
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -2172,55 +2178,65 @@ class ScreenshotTool:
 
     def start_drag(self, event, filepath, photo):
         """Start dragging a thumbnail"""
-        self.drag_data["filepath"] = filepath
-        self.drag_data["start_x"] = event.x_root
-        self.drag_data["start_y"] = event.y_root
+        try:
+            self.drag_data["filepath"] = filepath
+            self.drag_data["start_x"] = event.x_root
+            self.drag_data["start_y"] = event.y_root
 
-        # Create floating drag label
-        if self.drag_label:
-            self.drag_label.destroy()
+            # Create floating drag label
+            if self.drag_label:
+                try:
+                    self.drag_label.destroy()
+                except:
+                    pass
 
-        self.drag_label = tk.Toplevel(self.root)
-        self.drag_label.overrideredirect(True)  # No window decorations
-        self.drag_label.attributes('-alpha', 0.7)  # Semi-transparent
-        self.drag_label.attributes('-topmost', True)
+            self.drag_label = tk.Toplevel(self.root)
+            self.drag_label.overrideredirect(True)  # No window decorations
+            self.drag_label.attributes('-alpha', 0.7)  # Semi-transparent
+            self.drag_label.attributes('-topmost', True)
 
-        # Show mini version of the image
-        label = tk.Label(self.drag_label, image=photo, bg='white', relief=tk.RAISED, bd=2)
-        label.pack()
-        label.image = photo  # Keep reference
+            # Show mini version of the image
+            label = tk.Label(self.drag_label, image=photo, bg='white', relief=tk.RAISED, bd=2)
+            label.pack()
+            label.image = photo  # Keep reference
 
-        self.drag_label.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+            self.drag_label.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+        except Exception as e:
+            print(f"Error in start_drag: {e}")
+            self.drag_label = None
 
     def do_drag(self, event):
         """Handle drag motion"""
-        if self.drag_data["filepath"] and self.drag_label:
-            # Move the floating label
-            self.drag_label.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+        try:
+            if self.drag_data["filepath"] and self.drag_label:
+                # Move the floating label
+                self.drag_label.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
 
-            # Check if hovering over a drop target
-            for folder_name, btn in self.folder_drop_targets.items():
-                try:
-                    bx = btn.winfo_rootx()
-                    by = btn.winfo_rooty()
-                    bw = btn.winfo_width()
-                    bh = btn.winfo_height()
+                # Check if hovering over a drop target
+                for folder_name, btn in self.folder_drop_targets.items():
+                    try:
+                        bx = btn.winfo_rootx()
+                        by = btn.winfo_rooty()
+                        bw = btn.winfo_width()
+                        bh = btn.winfo_height()
 
-                    if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
-                        # Highlight this button
-                        btn.configure(bg='#4CAF50', fg='white')
-                    else:
-                        # Reset to normal (check if it's the selected folder)
-                        is_selected = self.current_folder == folder_name
-                        if folder_name is None:
-                            btn.configure(bg='#e0e0e0' if self.current_folder is None else '#f5f5f5', fg='#333')
+                        if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
+                            # Highlight this button
+                            btn.configure(bg='#4CAF50', fg='white')
                         else:
-                            btn.configure(
-                                bg='#4a90d9' if is_selected else '#f5f5f5',
-                                fg='white' if is_selected else '#333'
-                            )
-                except:
-                    pass
+                            # Reset to normal (check if it's the selected folder)
+                            is_selected = self.current_folder == folder_name
+                            if folder_name is None:
+                                btn.configure(bg='#e0e0e0' if self.current_folder is None else '#f5f5f5', fg='#333')
+                            else:
+                                btn.configure(
+                                    bg='#4a90d9' if is_selected else '#f5f5f5',
+                                    fg='white' if is_selected else '#333'
+                                )
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Error in do_drag: {e}")
 
     def end_drag(self, event):
         """End drag and check for drop target"""
@@ -2253,23 +2269,36 @@ class ScreenshotTool:
                 pass
 
         # Clean up
-        if self.drag_label:
-            self.drag_label.destroy()
+        try:
+            if self.drag_label:
+                self.drag_label.destroy()
+                self.drag_label = None
+        except:
             self.drag_label = None
         self.drag_data["filepath"] = None
 
         # Reset button colors
-        self.refresh_folder_bar()
+        try:
+            self.refresh_folder_bar()
+        except:
+            pass
 
     # ==================== END FOLDER MANAGEMENT ====================
 
     def refresh_gallery(self):
-        # Update disk usage display
-        self.update_disk_usage()
+        try:
+            # Update disk usage display
+            self.update_disk_usage()
 
-        # Clear existing thumbnails
-        for widget in self.gallery_frame.winfo_children():
-            widget.destroy()
+            # Clear existing thumbnails
+            for widget in self.gallery_frame.winfo_children():
+                try:
+                    widget.destroy()
+                except:
+                    pass
+        except Exception as e:
+            print(f"Error in refresh_gallery start: {e}")
+            return
 
         # Get list of screenshots based on current folder filter
         try:
@@ -2394,6 +2423,9 @@ class ScreenshotTool:
                         overlay_window.overrideredirect(True)
                         overlay_window.attributes('-topmost', True)
 
+                        # Track this window for cleanup
+                        self.floating_windows.append(overlay_window)
+
                         # Menu buttons - simple monochrome style
                         btn_style = {'font': ("Segoe UI", 8), 'cursor': "hand2", 'relief': tk.FLAT,
                                      'fg': '#333', 'pady': 3, 'bd': 0, 'width': 8,
@@ -2449,21 +2481,38 @@ class ScreenshotTool:
 
                     def cancel_hide():
                         nonlocal hide_timer
-                        if hide_timer:
-                            container.after_cancel(hide_timer)
-                            hide_timer = None
+                        try:
+                            if hide_timer:
+                                container.after_cancel(hide_timer)
+                                hide_timer = None
+                        except:
+                            pass
 
                     def schedule_hide():
                         nonlocal hide_timer
-                        hide_timer = container.after(100, hide_overlay_now)
+                        try:
+                            hide_timer = container.after(100, hide_overlay_now)
+                        except:
+                            pass
 
                     def hide_overlay_now():
                         nonlocal overlay_window, hide_timer
-                        if hide_timer:
-                            container.after_cancel(hide_timer)
-                            hide_timer = None
-                        if overlay_window:
-                            overlay_window.destroy()
+                        try:
+                            if hide_timer:
+                                container.after_cancel(hide_timer)
+                                hide_timer = None
+                        except:
+                            pass
+                        try:
+                            if overlay_window:
+                                # Remove from tracking list
+                                try:
+                                    self.floating_windows.remove(overlay_window)
+                                except:
+                                    pass
+                                overlay_window.destroy()
+                                overlay_window = None
+                        except:
                             overlay_window = None
 
                     container.bind("<Enter>", show_overlay)
@@ -2783,8 +2832,43 @@ class ScreenshotTool:
             self.refresh_gallery()
             self.status_var.set(f"Save location changed to: {new_dir}")
 
+    def cleanup_floating_windows(self):
+        """Cleanup any orphaned floating windows"""
+        try:
+            # Clean up drag label
+            if self.drag_label:
+                try:
+                    self.drag_label.destroy()
+                except:
+                    pass
+                self.drag_label = None
+
+            # Clean up tracked floating windows
+            for window in self.floating_windows[:]:
+                try:
+                    if window and window.winfo_exists():
+                        window.destroy()
+                except:
+                    pass
+                try:
+                    self.floating_windows.remove(window)
+                except:
+                    pass
+        except:
+            pass
+
+    def schedule_cleanup(self):
+        """Schedule periodic cleanup of floating windows"""
+        try:
+            self.cleanup_floating_windows()
+            # Schedule next cleanup in 5 seconds
+            self.root.after(5000, self.schedule_cleanup)
+        except:
+            pass
+
     def on_close(self):
         """Clean up and close"""
+        self.cleanup_floating_windows()
         self.unregister_hotkeys()
         self.root.destroy()
 
