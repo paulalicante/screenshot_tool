@@ -53,6 +53,13 @@ except ImportError:
     import pyautogui
     import pygetwindow as gw
 
+# Optional: Virtual desktop support
+try:
+    from pyvda import AppView, VirtualDesktop
+    PYVDA_AVAILABLE = True
+except ImportError:
+    PYVDA_AVAILABLE = False
+
 
 class DelayCountdown:
     """Shows a countdown timer before capturing"""
@@ -219,7 +226,7 @@ class WindowSelector:
 
 
 class RegionSelector:
-    """Fullscreen overlay for selecting a screen region"""
+    """Fullscreen overlay for selecting a screen region - captures screen first"""
 
     def __init__(self, callback):
         self.callback = callback
@@ -227,21 +234,46 @@ class RegionSelector:
         self.start_y = None
         self.rect = None
 
+        # FIRST: Capture the screen before showing any overlay
+        with mss.mss() as sct:
+            # Capture the primary monitor
+            monitor = sct.monitors[1]  # Primary monitor
+            screenshot = sct.grab(monitor)
+            self.captured_image = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+
         # Create fullscreen window
         self.overlay = tk.Toplevel()
         self.overlay.attributes('-fullscreen', True)
-        self.overlay.attributes('-alpha', 0.3)
         self.overlay.attributes('-topmost', True)
         self.overlay.configure(bg='black')
 
-        # Create canvas for drawing selection rectangle
+        # Get screen dimensions
+        screen_width = self.overlay.winfo_screenwidth()
+        screen_height = self.overlay.winfo_screenheight()
+
+        # Create a dimmed version of the captured image for the overlay
+        dimmed = self.captured_image.copy()
+        # Apply dark overlay effect
+        dark_overlay = Image.new('RGBA', dimmed.size, (0, 0, 0, 128))
+        dimmed = dimmed.convert('RGBA')
+        dimmed = Image.alpha_composite(dimmed, dark_overlay)
+        dimmed = dimmed.convert('RGB')
+
+        # Convert to PhotoImage for tkinter
+        self.bg_photo = ImageTk.PhotoImage(dimmed)
+
+        # Create canvas with the captured image as background
         self.canvas = tk.Canvas(
             self.overlay,
             highlightthickness=0,
-            bg='black',
-            cursor='crosshair'
+            cursor='crosshair',
+            width=screen_width,
+            height=screen_height
         )
         self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Set the dimmed screenshot as background
+        self.canvas.create_image(0, 0, anchor='nw', image=self.bg_photo)
 
         # Instructions label
         self.label = tk.Label(
@@ -265,14 +297,12 @@ class RegionSelector:
     def on_press(self, event):
         self.start_x = event.x
         self.start_y = event.y
-        # Create rectangle
+        # Create rectangle with red outline
         self.rect = self.canvas.create_rectangle(
             self.start_x, self.start_y,
             self.start_x, self.start_y,
             outline='red',
-            width=2,
-            fill='white',
-            stipple='gray50'
+            width=2
         )
 
     def on_drag(self, event):
@@ -298,14 +328,15 @@ class RegionSelector:
 
         # Check if region is valid (at least 10x10 pixels)
         if x2 - x1 > 10 and y2 - y1 > 10:
-            # Small delay to let overlay fully close
-            self.callback((x1, y1, x2, y2))
+            # Crop from the PRE-CAPTURED image (no overlay in it!)
+            cropped = self.captured_image.crop((x1, y1, x2, y2))
+            self.callback((x1, y1, x2, y2), cropped)
         else:
-            self.callback(None)
+            self.callback(None, None)
 
     def on_cancel(self, event):
         self.overlay.destroy()
-        self.callback(None)
+        self.callback(None, None)
 
 
 class ScreenshotEditor:
@@ -679,13 +710,17 @@ class ScreenshotEditor:
 class ScreenshotTool:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Screenshot Tool v1.04")
+        self.root.title("Screenshot Tool v1.05")
         self.root.geometry("600x550")
         self.root.minsize(400, 350)
 
         # Set up save directory
         self.save_dir = Path.home() / "Pictures" / "Screenshots"
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Push targets configuration
+        self.config_file = self.save_dir / "screenshot_tool_config.json"
+        self.push_targets = self.load_push_targets()
 
         # Hotkey configuration
         self.hotkey_full = "ctrl+shift+s"
@@ -697,14 +732,29 @@ class ScreenshotTool:
         # Screenshot counter for this session
         self.screenshot_count = 0
 
-        # Auto-paste to Claude setting
-        self.auto_paste_claude = tk.BooleanVar(value=False)
+        # Auto-send settings
+        self.auto_send_enabled = tk.BooleanVar(value=False)
+        self.auto_send_target = tk.StringVar(value="")
 
         # Edit before save setting (default: True - show editor)
         self.edit_before_save = tk.BooleanVar(value=True)
 
+        # Pin to all desktops setting
+        self.pin_to_all_desktops = tk.BooleanVar(value=False)
+
+        # Silent capture - don't switch desktop after capture
+        self.silent_capture = tk.BooleanVar(value=False)
+
+        # Drag and drop state
+        self.drag_data = {"filepath": None, "widget": None}
+        self.drag_label = None  # Floating label during drag
+        self.folder_drop_targets = {}  # folder_name -> button widget
+
         # Build the UI
         self.setup_ui()
+
+        # Apply pin setting after window is created
+        self.root.after(500, self.apply_pin_setting)
 
         # Register global hotkeys
         self.register_hotkeys()
@@ -727,59 +777,98 @@ class ScreenshotTool:
         self.disk_limit_mb = tk.IntVar(value=500)  # Max disk space in MB
         self.archive_days = tk.IntVar(value=30)  # Days before suggesting cleanup
 
-        # Top bar - Hotkey reminder and settings button
-        top_frame = ttk.Frame(main_frame)
-        top_frame.pack(fill=tk.X, pady=(0, 10))
+        # Create horizontal layout: left sidebar + right content
+        content_frame = ttk.Frame(main_frame)
+        content_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Hotkey buttons - show shortcuts and act as clickable triggers
-        hotkey_frame = ttk.Frame(top_frame)
-        hotkey_frame.pack(side=tk.LEFT)
+        # LEFT SIDEBAR
+        sidebar = ttk.Frame(content_frame, padding="5")
+        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
-        btn_style = {"width": 18}
+        # Spacer to align buttons with first row of thumbnails (leaves room for logo)
+        ttk.Frame(sidebar, height=110).pack()
+
+        # Sidebar buttons - stacked vertically
+        btn_width = 20
         ttk.Button(
-            hotkey_frame, text="Ctrl+Shift+R: Region",
-            command=self.start_region_capture, **btn_style
-        ).pack(side=tk.LEFT, padx=(0, 5))
+            sidebar, text="Region (Ctrl+Shift+R)",
+            command=self.start_region_capture, width=btn_width
+        ).pack(fill=tk.X, pady=(0, 5))
         ttk.Button(
-            hotkey_frame, text="Ctrl+Shift+S: Screen",
-            command=self.capture_fullscreen, **btn_style
-        ).pack(side=tk.LEFT, padx=(0, 5))
+            sidebar, text="Screen (Ctrl+Shift+S)",
+            command=self.capture_fullscreen, width=btn_width
+        ).pack(fill=tk.X, pady=(0, 5))
         ttk.Button(
-            hotkey_frame, text="Ctrl+Shift+W: Window",
-            command=self.start_window_capture, **btn_style
-        ).pack(side=tk.LEFT)
+            sidebar, text="Window (Ctrl+Shift+W)",
+            command=self.start_window_capture, width=btn_width
+        ).pack(fill=tk.X, pady=(0, 15))
 
-        # Settings button (gear icon using unicode)
-        settings_btn = ttk.Button(
-            top_frame,
-            text="\u2699 Settings",
-            command=self.show_settings,
-            width=10
-        )
-        settings_btn.pack(side=tk.RIGHT)
+        ttk.Button(
+            sidebar, text="Import from File",
+            command=self.import_image, width=btn_width
+        ).pack(fill=tk.X, pady=(0, 5))
 
-        # Disk usage indicator (to the left of Settings)
+        ttk.Button(
+            sidebar, text="Paste from Clipboard",
+            command=self.paste_from_clipboard, width=btn_width
+        ).pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(
+            sidebar, text="\u2699 Settings",
+            command=self.show_settings, width=btn_width
+        ).pack(fill=tk.X, pady=(0, 15))
+
+        # Disk usage indicator in sidebar
         self.disk_usage_var = tk.StringVar(value="")
-        self.disk_label = tk.Label(top_frame, textvariable=self.disk_usage_var, font=("", 8), fg="gray")
-        self.disk_label.pack(side=tk.RIGHT, padx=(0, 10))
+        self.disk_label = tk.Label(sidebar, textvariable=self.disk_usage_var, font=("", 8), fg="gray")
+        self.disk_label.pack(pady=(5, 0))
+
+        # Spacer to push counter to bottom
+        ttk.Frame(sidebar).pack(fill=tk.BOTH, expand=True)
+
+        # Counter display at bottom of sidebar
+        self.counter_var = tk.StringVar(value="Session: 0")
+        counter_label = ttk.Label(sidebar, textvariable=self.counter_var, font=("", 8))
+        counter_label.pack(pady=(10, 0))
+
+        # VERTICAL DIVIDER
+        divider = ttk.Separator(content_frame, orient=tk.VERTICAL)
+        divider.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+
+        # RIGHT CONTENT AREA
+        right_frame = ttk.Frame(content_frame)
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # Status label
         self.status_var = tk.StringVar(value="Ready")
-        status_label = ttk.Label(main_frame, textvariable=self.status_var, foreground="gray")
+        status_label = ttk.Label(right_frame, textvariable=self.status_var, foreground="gray")
         status_label.pack(fill=tk.X, pady=(0, 5))
 
-        # Gallery section
-        gallery_label = ttk.Label(main_frame, text="Recent Screenshots:", font=("", 10, "bold"))
-        gallery_label.pack(fill=tk.X, pady=(10, 5))
+        # Current folder filter (None = show all)
+        self.current_folder = None
+
+        # Folder bar
+        folder_bar = ttk.Frame(right_frame)
+        folder_bar.pack(fill=tk.X, pady=(0, 5))
+
+        # Container for folder buttons (will be refreshed)
+        self.folder_buttons_frame = ttk.Frame(folder_bar)
+        self.folder_buttons_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # New folder button
+        ttk.Button(folder_bar, text="+", width=3, command=self.create_new_folder).pack(side=tk.RIGHT, padx=(5, 0))
+
+        # Build initial folder buttons
+        self.refresh_folder_bar()
 
         # Canvas with scrollbar for gallery
-        gallery_container = ttk.Frame(main_frame)
-        gallery_container.pack(fill=tk.BOTH, expand=True)
+        gallery_container = tk.Frame(right_frame, relief=tk.SUNKEN, bd=1, bg="#e8e8e8")
+        gallery_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.canvas = tk.Canvas(gallery_container, bg="white")
+        self.canvas = tk.Canvas(gallery_container, bg="#f5f5f5", highlightthickness=0)
         scrollbar = ttk.Scrollbar(gallery_container, orient=tk.VERTICAL, command=self.canvas.yview)
 
-        self.gallery_frame = ttk.Frame(self.canvas)
+        self.gallery_frame = tk.Frame(self.canvas, bg="#f5f5f5")
 
         self.canvas.configure(yscrollcommand=scrollbar.set)
 
@@ -794,11 +883,6 @@ class ScreenshotTool:
 
         # Mouse wheel scrolling
         self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)
-
-        # Counter display
-        self.counter_var = tk.StringVar(value="Screenshots this session: 0")
-        counter_label = ttk.Label(main_frame, textvariable=self.counter_var)
-        counter_label.pack(fill=tk.X, pady=(10, 0))
 
     def on_frame_configure(self, event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -891,11 +975,16 @@ class ScreenshotTool:
     def on_window_selected(self, hwnd):
         """Called when window selection is complete"""
         self._capture_in_progress = False  # Reset flag
-        self.root.deiconify()
 
         if hwnd is None:
             self.status_var.set("Window capture cancelled")
+            if not self.silent_capture.get():
+                self.root.deiconify()
             return
+
+        # Only restore window if not in silent capture mode (and not using editor)
+        if not self.silent_capture.get() or self.edit_before_save.get():
+            self.root.deiconify()
 
         self.capture_window(hwnd)
 
@@ -973,19 +1062,29 @@ class ScreenshotTool:
         """Show the region selector overlay"""
         RegionSelector(self.on_region_selected)
 
-    def on_region_selected(self, region):
+    def on_region_selected(self, region, cropped_image):
         """Called when region selection is complete"""
         self._capture_in_progress = False  # Reset flag
-        # Restore main window
-        self.root.deiconify()
 
-        if region is None:
+        # Only restore main window if not in silent capture mode
+        if not self.silent_capture.get():
+            self.root.deiconify()
+
+        if region is None or cropped_image is None:
             self.status_var.set("Region capture cancelled")
+            if not self.silent_capture.get():
+                self.root.deiconify()  # Show window on cancel
             return
 
-        # Capture the selected region
-        x1, y1, x2, y2 = region
-        self.capture_region(x1, y1, x2, y2)
+        # Image is already captured and cropped by RegionSelector
+        # Open editor or save directly
+        if self.edit_before_save.get():
+            self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
+            # Editor needs window visible
+            self.root.deiconify()
+            ScreenshotEditor(cropped_image, self.on_editor_complete)
+        else:
+            self.save_screenshot(cropped_image)
 
     def capture_region(self, x1, y1, x2, y2):
         """Capture a specific region of the screen"""
@@ -1054,14 +1153,16 @@ class ScreenshotTool:
                 screenshot = sct.grab(sct.monitors[0])  # Monitor 0 = all monitors combined
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
-            # Restore window
-            self.root.deiconify()
-
             # Open editor or save directly
             if self.edit_before_save.get():
+                # Editor needs window visible
+                self.root.deiconify()
                 self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
                 ScreenshotEditor(img, self.on_editor_complete)
             else:
+                # Only restore window if not in silent capture mode
+                if not self.silent_capture.get():
+                    self.root.deiconify()
                 self.save_screenshot(img)
 
         except Exception as e:
@@ -1085,7 +1186,14 @@ class ScreenshotTool:
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"screenshot_{timestamp}.png"
-        filepath = self.save_dir / filename
+
+        # Save to current folder if one is selected, otherwise root
+        if self.current_folder:
+            save_dir = self.save_dir / self.current_folder
+            save_dir.mkdir(exist_ok=True)
+        else:
+            save_dir = self.save_dir
+        filepath = save_dir / filename
 
         # Save the image
         img.save(str(filepath), "PNG")
@@ -1098,7 +1206,8 @@ class ScreenshotTool:
         self.counter_var.set(f"Screenshots this session: {self.screenshot_count}")
 
         # Update status
-        self.status_var.set(f"Saved & copied to clipboard: {filename}")
+        folder_info = f" [{self.current_folder}]" if self.current_folder else ""
+        self.status_var.set(f"Saved{folder_info} & copied: {filename}")
 
         # Refresh gallery
         self.refresh_gallery()
@@ -1109,85 +1218,591 @@ class ScreenshotTool:
         print(f"Screenshot saved: {filepath}")
         print("Image copied to clipboard - ready to paste!")
 
-        # Auto-paste to Claude if enabled
-        if self.auto_paste_claude.get():
-            self.root.after(200, self.paste_to_vscode_claude)
+        # Auto-send to target if enabled
+        if self.auto_send_enabled.get():
+            target_name = self.auto_send_target.get()
+            target = next((t for t in self.push_targets if t['name'] == target_name), None)
+            if target:
+                self.root.after(200, lambda: self.paste_to_target(target))
 
     def copy_to_clipboard(self, img):
         """Copy image to Windows clipboard using pywin32"""
         import io
         import win32clipboard
 
-        # Convert to RGB if necessary
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-
-        # Save as BMP to memory
-        output = io.BytesIO()
-        img.save(output, 'BMP')
-        bmp_data = output.getvalue()
-        output.close()
-
-        # Skip BMP file header (14 bytes) to get DIB data
-        dib_data = bmp_data[14:]
-
-        # Use win32clipboard (much more reliable than ctypes)
         try:
+            # Convert to RGB if necessary
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            # Save as BMP to memory
+            output = io.BytesIO()
+            img.save(output, 'BMP')
+            bmp_data = output.getvalue()
+            output.close()
+
+            # Skip BMP file header (14 bytes) to get DIB data
+            dib_data = bmp_data[14:]
+
+            # Use win32clipboard (much more reliable than ctypes)
             win32clipboard.OpenClipboard()
             win32clipboard.EmptyClipboard()
             win32clipboard.SetClipboardData(win32clipboard.CF_DIB, dib_data)
-        finally:
             win32clipboard.CloseClipboard()
+        except Exception as e:
+            print(f"Clipboard error (image still saved): {e}")
+            try:
+                win32clipboard.CloseClipboard()
+            except:
+                pass
 
-    def paste_to_vscode_claude(self):
-        """Find VSCode window and paste the screenshot into Claude input"""
+    def load_push_targets(self):
+        """Load push targets from config file"""
+        import json
+        default_targets = [
+            {
+                "name": "VSCode Claude",
+                "title_pattern": "Visual Studio Code",
+                "click_x": None,  # None = don't click, just paste
+                "click_y": None,
+                "enabled": True
+            },
+            {
+                "name": "WhatsApp",
+                "title_pattern": "WhatsApp",
+                "click_x": None,
+                "click_y": None,
+                "enabled": True
+            },
+            {
+                "name": "Discord",
+                "title_pattern": "Discord",
+                "click_x": None,
+                "click_y": None,
+                "enabled": True
+            },
+            {
+                "name": "Slack",
+                "title_pattern": "Slack",
+                "click_x": None,
+                "click_y": None,
+                "enabled": True
+            },
+            {
+                "name": "Microsoft Teams",
+                "title_pattern": "Microsoft Teams",
+                "click_x": None,
+                "click_y": None,
+                "enabled": True
+            }
+        ]
+
+        try:
+            if self.config_file.exists():
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    return config.get('push_targets', default_targets)
+        except Exception as e:
+            print(f"Error loading config: {e}")
+
+        return default_targets
+
+    def save_push_targets(self):
+        """Save push targets and settings to config file"""
+        import json
+        try:
+            config = {
+                'push_targets': self.push_targets,
+                'pin_to_all_desktops': self.pin_to_all_desktops.get(),
+                'auto_send_enabled': self.auto_send_enabled.get(),
+                'auto_send_target': self.auto_send_target.get(),
+                'edit_before_save': self.edit_before_save.get(),
+                'silent_capture': self.silent_capture.get()
+            }
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
+    def paste_to_target(self, target):
+        """Paste clipboard content to a registered target application"""
         try:
             import win32gui
             import win32con
 
-            # Find VSCode window - look for windows with "Visual Studio Code" in title
-            vscode_windows = [w for w in gw.getAllWindows()
-                           if 'Visual Studio Code' in w.title or 'VSCode' in w.title]
+            # Find window by title pattern - search all windows
+            hwnd = None
+            target_pattern = target['title_pattern'].lower()
 
-            if not vscode_windows:
-                self.status_var.set("VSCode not found - image in clipboard")
-                print("Could not find VSCode window")
-                return
+            def enum_callback(h, results):
+                if win32gui.IsWindowVisible(h):
+                    title = win32gui.GetWindowText(h)
+                    if target_pattern in title.lower():
+                        results.append(h)
+                return True
 
-            # Get the first VSCode window
-            vscode = vscode_windows[0]
+            results = []
+            win32gui.EnumWindows(enum_callback, results)
 
-            # Get the window handle for more reliable activation
-            hwnd = vscode._hWnd
+            if not results:
+                self.status_var.set(f"'{target['name']}' window not found")
+                return False
+
+            hwnd = results[0]
+
+            # Move target window to CURRENT desktop if pyvda is available
+            if PYVDA_AVAILABLE:
+                try:
+                    current_desktop = VirtualDesktop.current()
+                    target_view = AppView(hwnd)
+                    target_desktop = target_view.desktop
+                    # Only move if on a different desktop
+                    if target_desktop and target_desktop != current_desktop:
+                        target_view.move(current_desktop)
+                        time.sleep(0.15)  # Give move time to complete
+                except Exception as e:
+                    print(f"Move to current desktop failed (continuing anyway): {e}")
 
             # Restore if minimized
             if win32gui.IsIconic(hwnd):
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.1)
 
-            # Bring window to foreground using Windows API (more reliable)
-            win32gui.SetForegroundWindow(hwnd)
+            # Bring window to foreground - use robust method
+            self._force_foreground_window(hwnd)
 
-            # Brief wait for window to come to foreground
             time.sleep(0.2)
 
-            # Just paste - don't try to click anywhere
-            # The paste will go to whatever has focus in VSCode
-            # User should have Claude input focused (or it will paste to last focused area)
-            pyautogui.hotkey('ctrl', 'v')
+            # Click at position if specified
+            if target.get('click_x') is not None and target.get('click_y') is not None:
+                # Get window position
+                rect = win32gui.GetWindowRect(hwnd)
+                win_x, win_y = rect[0], rect[1]
+                win_width = rect[2] - rect[0]
+                win_height = rect[3] - rect[1]
 
-            self.status_var.set(f"Pasted to VSCode! (Make sure Claude input has focus)")
-            print("Screenshot pasted to VSCode")
+                # Calculate click position based on offset type
+                if target.get('offset_type') == 'relative_bottom_center':
+                    click_x = win_x + win_width // 2 + target['click_x']
+                    click_y = win_y + win_height + target['click_y']
+                else:  # absolute from top-left
+                    click_x = win_x + target['click_x']
+                    click_y = win_y + target['click_y']
+
+                pyautogui.click(click_x, click_y)
+                time.sleep(0.1)
+
+            # Paste
+            pyautogui.hotkey('ctrl', 'v')
+            self.status_var.set(f"Pasted to {target['name']}!")
+            return True
 
         except Exception as e:
-            error_msg = f"Auto-paste failed: {e}"
-            self.status_var.set(f"Saved (auto-paste failed: {e})")
-            print(error_msg)
+            self.status_var.set(f"Paste to {target['name']} failed: {e}")
+            print(f"Paste error: {e}")
+            return False
+
+    def _force_foreground_window(self, hwnd):
+        """Force a window to foreground by clicking on it"""
+        import win32gui
+        import win32con
+
+        try:
+            # Restore if minimized
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.1)
+
+            # Get window rectangle
+            rect = win32gui.GetWindowRect(hwnd)
+
+            # Click in the center of the window to activate it
+            center_x = (rect[0] + rect[2]) // 2
+            center_y = (rect[1] + rect[3]) // 2
+
+            # Move mouse and click to activate window
+            pyautogui.click(center_x, center_y)
+            time.sleep(0.15)
+
+        except Exception as e:
+            print(f"Foreground switch error: {e}")
+
+    def send_to_target(self, screenshot_path, target_name):
+        """Copy image to clipboard and send to target"""
+        try:
+            # Load image and copy to clipboard
+            img = Image.open(screenshot_path)
+            self.copy_to_clipboard(img)
+
+            # Find target
+            target = next((t for t in self.push_targets if t['name'] == target_name), None)
+            if target:
+                self.root.after(100, lambda: self.paste_to_target(target))
+        except Exception as e:
+            self.status_var.set(f"Send failed: {e}")
+
+    def register_new_target(self, on_complete=None):
+        """Start the target registration process"""
+        # Create instruction window
+        reg_win = tk.Toplevel(self.root)
+        reg_win.title("Register Push Target")
+        reg_win.geometry("400x180")
+        reg_win.transient(self.root)
+        reg_win.attributes('-topmost', True)
+        # Center on parent
+        reg_win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 400) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 180) // 2
+        reg_win.geometry(f"+{x}+{y}")
+
+        frame = ttk.Frame(reg_win, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text="Register a New Push Target",
+            font=("", 12, "bold")
+        ).pack(pady=(0, 15))
+
+        ttk.Label(
+            frame,
+            text="Normal: Match window title and paste\n"
+                 "(works for most apps)\n\n"
+                 "Advanced: Capture exact click position\n"
+                 "(for apps that need a specific input field)",
+            justify=tk.LEFT
+        ).pack(pady=(0, 15))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack()
+
+        def normal_mode():
+            reg_win.destroy()
+            self.register_simple_target(on_complete)
+
+        def advanced_mode():
+            reg_win.destroy()
+            self.capture_target_position(on_complete)
+
+        ttk.Button(btn_frame, text="Normal", command=normal_mode).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Advanced", command=advanced_mode).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=reg_win.destroy).pack(side=tk.LEFT, padx=5)
+
+    def register_simple_target(self, on_complete=None):
+        """Register a target with just window title matching (no click position)"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Push Target")
+        dialog.geometry("350x200")
+        dialog.transient(self.root)
+
+        # Center on parent
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 350) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 200) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Target Name:").pack(anchor=tk.W)
+        name_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=name_var, width=40).pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(frame, text="Window Title Contains:").pack(anchor=tk.W)
+        title_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=title_var, width=40).pack(fill=tk.X, pady=(0, 15))
+
+        def save():
+            name = name_var.get().strip()
+            title = title_var.get().strip()
+            if name and title:
+                self.push_targets.append({
+                    "name": name,
+                    "title_pattern": title,
+                    "click_x": None,
+                    "click_y": None,
+                    "enabled": True
+                })
+                self.save_push_targets()
+                messagebox.showinfo("Success", f"Target '{name}' added!")
+                dialog.destroy()
+                if on_complete:
+                    on_complete()
+            else:
+                messagebox.showwarning("Missing Info", "Please fill in both fields")
+
+        ttk.Button(frame, text="Save", command=save).pack()
+
+    def capture_target_position(self, on_complete=None):
+        """Capture the target window and click position"""
+        # Register temporary hotkey
+        self.status_var.set("Click in target app, then press Ctrl+Shift+T...")
+        self.root.iconify()
+
+        def on_capture():
+            try:
+                import win32gui
+                # Get foreground window
+                hwnd = win32gui.GetForegroundWindow()
+                title = win32gui.GetWindowText(hwnd)
+                rect = win32gui.GetWindowRect(hwnd)
+
+                # Get mouse position
+                mouse_x, mouse_y = pyautogui.position()
+
+                # Calculate offset from window top-left
+                offset_x = mouse_x - rect[0]
+                offset_y = mouse_y - rect[1]
+
+                # Unregister hotkey
+                keyboard.remove_hotkey('ctrl+shift+t')
+
+                # Show dialog to name the target
+                self.root.deiconify()
+                self.root.after(100, lambda: self.finish_target_registration(
+                    title, offset_x, offset_y, on_complete
+                ))
+
+            except Exception as e:
+                print(f"Capture error: {e}")
+                self.root.deiconify()
+
+        keyboard.add_hotkey('ctrl+shift+t', on_capture)
+
+    def finish_target_registration(self, window_title, offset_x, offset_y, on_complete=None):
+        """Complete the target registration with a name dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Name Your Target")
+        dialog.geometry("350x220")
+        dialog.transient(self.root)
+
+        # Center on parent
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 350) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 220) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text=f"Window: {window_title[:40]}...").pack(anchor=tk.W)
+        ttk.Label(frame, text=f"Click position: ({offset_x}, {offset_y})").pack(anchor=tk.W, pady=(0, 10))
+
+        ttk.Label(frame, text="Target Name:").pack(anchor=tk.W)
+        name_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=name_var, width=40).pack(fill=tk.X, pady=(0, 10))
+
+        # Extract a reasonable title pattern
+        title_pattern = window_title.split(" - ")[0] if " - " in window_title else window_title[:30]
+        ttk.Label(frame, text="Window Title Pattern:").pack(anchor=tk.W)
+        pattern_var = tk.StringVar(value=title_pattern)
+        ttk.Entry(frame, textvariable=pattern_var, width=40).pack(fill=tk.X, pady=(0, 15))
+
+        def save():
+            name = name_var.get().strip()
+            pattern = pattern_var.get().strip()
+            if name and pattern:
+                self.push_targets.append({
+                    "name": name,
+                    "title_pattern": pattern,
+                    "click_x": offset_x,
+                    "click_y": offset_y,
+                    "offset_type": "absolute_from_top_left",
+                    "enabled": True
+                })
+                self.save_push_targets()
+                messagebox.showinfo("Success", f"Target '{name}' added!")
+                dialog.destroy()
+                if on_complete:
+                    on_complete()
+
+        ttk.Button(frame, text="Save Target", command=save).pack()
+
+    def import_image(self):
+        """Import an existing image from disk"""
+        filetypes = [
+            ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+            ("PNG files", "*.png"),
+            ("JPEG files", "*.jpg *.jpeg"),
+            ("All files", "*.*")
+        ]
+
+        filepath = filedialog.askopenfilename(
+            title="Select Image to Import",
+            filetypes=filetypes,
+            initialdir=str(Path.home() / "Pictures")
+        )
+
+        if not filepath:
+            return  # User cancelled
+
+        try:
+            # Load the image
+            img = Image.open(filepath)
+
+            # Convert to RGB if necessary (for consistency)
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+
+            self.status_var.set(f"Imported: {Path(filepath).name}")
+
+            # Open editor or save directly
+            if self.edit_before_save.get():
+                self.status_var.set("Edit imported image (add highlights, then Save or Cancel)")
+                ScreenshotEditor(img, self.on_editor_complete)
+            else:
+                self.save_screenshot(img)
+
+        except Exception as e:
+            error_msg = f"Error importing image: {e}"
+            self.status_var.set(error_msg)
+            messagebox.showerror("Import Error", error_msg)
+
+    def paste_from_clipboard(self):
+        """Import an image from the clipboard"""
+        from PIL import ImageGrab
+
+        try:
+            # Try to get image from clipboard
+            img = ImageGrab.grabclipboard()
+
+            if img is None:
+                self.status_var.set("No image in clipboard")
+                messagebox.showinfo("Paste", "No image found in clipboard")
+                return
+
+            # Check if it's actually an image
+            if not isinstance(img, Image.Image):
+                # Sometimes it returns a list of file paths
+                if isinstance(img, list) and len(img) > 0:
+                    # Try to open the first file
+                    img = Image.open(img[0])
+                else:
+                    self.status_var.set("Clipboard doesn't contain an image")
+                    messagebox.showinfo("Paste", "Clipboard doesn't contain an image")
+                    return
+
+            # Convert to RGB if necessary
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+
+            self.status_var.set("Pasted image from clipboard")
+
+            # Open editor or save directly
+            if self.edit_before_save.get():
+                self.status_var.set("Edit pasted image (add highlights, then Save or Cancel)")
+                ScreenshotEditor(img, self.on_editor_complete)
+            else:
+                self.save_screenshot(img)
+
+        except Exception as e:
+            error_msg = f"Error pasting from clipboard: {e}"
+            self.status_var.set(error_msg)
+            messagebox.showerror("Paste Error", error_msg)
 
     def flash_notification(self):
         # Brief visual flash to confirm capture
         original_bg = self.root.cget("bg")
         self.root.configure(bg="green")
         self.root.after(100, lambda: self.root.configure(bg=original_bg))
+
+    def apply_pin_setting(self):
+        """Load settings from config file"""
+        import json
+        try:
+            if self.config_file.exists():
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    self.pin_to_all_desktops.set(config.get('pin_to_all_desktops', False))
+                    self.auto_send_enabled.set(config.get('auto_send_enabled', False))
+                    self.auto_send_target.set(config.get('auto_send_target', ''))
+                    self.edit_before_save.set(config.get('edit_before_save', True))
+                    self.silent_capture.set(config.get('silent_capture', False))
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+
+    def pin_window(self):
+        """Pin the window to appear on all virtual desktops"""
+        global PYVDA_AVAILABLE, AppView, VirtualDesktop
+        import win32gui
+
+        if not PYVDA_AVAILABLE:
+            # Try to install pyvda
+            try:
+                print("Installing pyvda for virtual desktop support...")
+                install_package("pyvda")
+                from pyvda import AppView, VirtualDesktop
+                PYVDA_AVAILABLE = True
+            except Exception as e:
+                self._show_manual_pin_instructions()
+                self.pin_to_all_desktops.set(False)
+                return False
+
+        try:
+            # Make sure window is visible and get proper handle
+            self.root.update()
+            self.root.lift()
+
+            # Try to find our window by title (more reliable than winfo_id)
+            hwnd = win32gui.FindWindow(None, self.root.title())
+
+            if not hwnd:
+                # Fallback to winfo_id
+                hwnd = int(self.root.winfo_id())
+                # Get the root/parent window
+                parent = win32gui.GetParent(hwnd)
+                if parent:
+                    hwnd = parent
+
+            print(f"Attempting to pin window with hwnd: {hwnd}")
+
+            # Pin using pyvda
+            view = AppView(hwnd)
+            view.pin()
+            self.status_var.set("Window pinned to all desktops")
+            return True
+        except Exception as e:
+            print(f"Pin failed: {e}")
+            self._show_manual_pin_instructions()
+            self.pin_to_all_desktops.set(False)
+            return False
+
+    def _show_manual_pin_instructions(self):
+        """Show instructions for manually pinning the window"""
+        messagebox.showinfo(
+            "Pin to All Desktops",
+            "Automatic pinning not available.\n\n"
+            "To pin manually:\n"
+            "1. Press Win+Tab to open Task View\n"
+            "2. Right-click on this app's window\n"
+            "3. Select 'Show this window on all desktops'\n\n"
+            "Or: Right-click the app icon in taskbar → "
+            "hover over the window preview → right-click → "
+            "'Show this window on all desktops'"
+        )
+
+    def unpin_window(self):
+        """Unpin the window from all virtual desktops"""
+        if not PYVDA_AVAILABLE:
+            return False
+
+        try:
+            hwnd = int(self.root.winfo_id())
+            view = AppView(hwnd)
+            view.unpin()
+            self.status_var.set("Window unpinned from all desktops")
+            return True
+        except Exception as e:
+            print(f"Unpin failed: {e}")
+            return False
+
+    def toggle_pin(self):
+        """Toggle pin to all desktops - show instructions"""
+        if self.pin_to_all_desktops.get():
+            # Just show instructions - auto-pin is unreliable with tkinter
+            self._show_manual_pin_instructions()
+        # Save the setting (as a reminder that user wanted this)
+        self.save_push_targets()
 
     def get_thumbnail_size(self):
         """Calculate thumbnail size based on scale (1-10)"""
@@ -1299,6 +1914,355 @@ class ScreenshotTool:
         if result:
             self.cleanup_old_screenshots()
 
+    # ==================== FOLDER MANAGEMENT ====================
+
+    def get_folders(self):
+        """Get list of subfolders in the screenshot directory"""
+        folders = []
+        try:
+            for item in self.save_dir.iterdir():
+                if item.is_dir() and not item.name.startswith('.'):
+                    folders.append(item.name)
+            folders.sort()
+        except Exception as e:
+            print(f"Error reading folders: {e}")
+        return folders
+
+    def refresh_folder_bar(self):
+        """Rebuild the folder buttons"""
+        # Clear existing buttons and drop targets
+        for widget in self.folder_buttons_frame.winfo_children():
+            widget.destroy()
+        self.folder_drop_targets = {}
+
+        # Button style for folder tabs
+        btn_style = {
+            'font': ('Segoe UI', 9),
+            'cursor': 'hand2',
+            'relief': tk.FLAT,
+            'bd': 1,
+            'padx': 12,
+            'pady': 4,
+        }
+
+        # "All" button (also a drop target for root)
+        all_btn = tk.Button(
+            self.folder_buttons_frame,
+            text="All",
+            bg='#e0e0e0' if self.current_folder is None else '#f5f5f5',
+            fg='#333',
+            activebackground='#d0d0d0',
+            command=lambda: self.select_folder(None),
+            **btn_style
+        )
+        all_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.folder_drop_targets[None] = all_btn  # None = root folder
+
+        # Folder buttons
+        for folder in self.get_folders():
+            is_selected = self.current_folder == folder
+            btn = tk.Button(
+                self.folder_buttons_frame,
+                text=folder,
+                bg='#4a90d9' if is_selected else '#f5f5f5',
+                fg='white' if is_selected else '#333',
+                activebackground='#3a80c9' if is_selected else '#d0d0d0',
+                command=lambda f=folder: self.select_folder(f),
+                **btn_style
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 4))
+            self.folder_drop_targets[folder] = btn
+
+            # Right-click context menu for folder management
+            btn.bind("<Button-3>", lambda e, f=folder: self.show_folder_menu(e, f))
+
+    def select_folder(self, folder_name):
+        """Select a folder to filter gallery"""
+        self.current_folder = folder_name
+        self.refresh_folder_bar()
+        self.refresh_gallery()
+        if folder_name:
+            self.status_var.set(f"Showing: {folder_name}")
+        else:
+            self.status_var.set("Showing: All screenshots")
+
+    def create_new_folder(self):
+        """Create a new folder"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("New Folder")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        # Center on parent
+        dialog.geometry("300x120")
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 300) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 120) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Folder name:").pack(anchor=tk.W)
+        name_var = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=name_var, width=30)
+        entry.pack(fill=tk.X, pady=(5, 15))
+        entry.focus()
+
+        def create():
+            name = name_var.get().strip()
+            if not name:
+                return
+            # Sanitize folder name
+            name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+            if not name:
+                messagebox.showerror("Error", "Invalid folder name")
+                return
+            folder_path = self.save_dir / name
+            try:
+                folder_path.mkdir(exist_ok=True)
+                dialog.destroy()
+                self.refresh_folder_bar()
+                self.select_folder(name)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not create folder: {e}")
+
+        entry.bind("<Return>", lambda e: create())
+        ttk.Button(frame, text="Create", command=create).pack()
+
+    def show_folder_menu(self, event, folder_name):
+        """Show context menu for folder management"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Rename...", command=lambda: self.rename_folder(folder_name))
+        menu.add_command(label="Delete...", command=lambda: self.delete_folder(folder_name))
+        menu.post(event.x_root, event.y_root)
+
+    def rename_folder(self, old_name):
+        """Rename a folder"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Rename Folder")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        dialog.geometry("300x120")
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 300) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 120) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        frame = ttk.Frame(dialog, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="New name:").pack(anchor=tk.W)
+        name_var = tk.StringVar(value=old_name)
+        entry = ttk.Entry(frame, textvariable=name_var, width=30)
+        entry.pack(fill=tk.X, pady=(5, 15))
+        entry.focus()
+        entry.select_range(0, tk.END)
+
+        def do_rename():
+            new_name = name_var.get().strip()
+            if not new_name or new_name == old_name:
+                dialog.destroy()
+                return
+            # Sanitize folder name
+            new_name = "".join(c for c in new_name if c.isalnum() or c in (' ', '-', '_')).strip()
+            if not new_name:
+                messagebox.showerror("Error", "Invalid folder name")
+                return
+
+            old_path = self.save_dir / old_name
+            new_path = self.save_dir / new_name
+
+            if new_path.exists():
+                messagebox.showerror("Error", f"Folder '{new_name}' already exists")
+                return
+
+            try:
+                old_path.rename(new_path)
+                dialog.destroy()
+                # Update current folder if we renamed the active one
+                if self.current_folder == old_name:
+                    self.current_folder = new_name
+                self.refresh_folder_bar()
+                self.refresh_gallery()
+                self.status_var.set(f"Renamed: {old_name} → {new_name}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not rename folder: {e}")
+
+        entry.bind("<Return>", lambda e: do_rename())
+        ttk.Button(frame, text="Rename", command=do_rename).pack()
+
+    def delete_folder(self, folder_name):
+        """Delete a folder (must be empty or move contents to root)"""
+        folder_path = self.save_dir / folder_name
+        images = list(folder_path.glob("*.png"))
+
+        if images:
+            result = messagebox.askyesnocancel(
+                "Delete Folder",
+                f"Folder '{folder_name}' contains {len(images)} image(s).\n\n"
+                "Yes = Move images to root and delete folder\n"
+                "No = Cancel"
+            )
+            if result is None or result is False:
+                return
+            # Move images to root
+            import shutil
+            for img in images:
+                dest = self.save_dir / img.name
+                if dest.exists():
+                    # Add suffix if file exists
+                    base = img.stem
+                    dest = self.save_dir / f"{base}_moved{img.suffix}"
+                shutil.move(str(img), str(dest))
+
+        try:
+            folder_path.rmdir()
+            # Switch to All if we deleted the current folder
+            if self.current_folder == folder_name:
+                self.current_folder = None
+            self.refresh_folder_bar()
+            self.refresh_gallery()
+            self.status_var.set(f"Deleted folder: {folder_name}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not delete folder: {e}")
+
+    def move_to_folder(self, filepath, folder_name):
+        """Move an image to a folder"""
+        import shutil
+        try:
+            if folder_name:
+                dest_dir = self.save_dir / folder_name
+                dest_dir.mkdir(exist_ok=True)
+            else:
+                dest_dir = self.save_dir
+            dest_path = dest_dir / filepath.name
+            if dest_path.exists() and dest_path != filepath:
+                if not messagebox.askyesno("File Exists", f"'{filepath.name}' already exists in {folder_name or 'root'}. Overwrite?"):
+                    return
+            shutil.move(str(filepath), str(dest_path))
+            self.refresh_gallery()
+            self.status_var.set(f"Moved to {folder_name or 'root'}: {filepath.name}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not move file: {e}")
+
+    def show_move_menu(self, event, filepath):
+        """Show popup menu for moving image to folder"""
+        menu = tk.Menu(self.root, tearoff=0)
+
+        # Get current folder of this file
+        current_folder = None
+        if filepath.parent != self.save_dir:
+            current_folder = filepath.parent.name
+
+        # Add "Root" option if not already in root
+        if current_folder is not None:
+            menu.add_command(label="Root (main folder)", command=lambda: self.move_to_folder(filepath, None))
+            menu.add_separator()
+
+        # Add folder options
+        for folder in self.get_folders():
+            if folder != current_folder:
+                menu.add_command(label=folder, command=lambda f=folder: self.move_to_folder(filepath, f))
+
+        menu.post(event.x_root, event.y_root)
+
+    # ==================== DRAG AND DROP ====================
+
+    def start_drag(self, event, filepath, photo):
+        """Start dragging a thumbnail"""
+        self.drag_data["filepath"] = filepath
+        self.drag_data["start_x"] = event.x_root
+        self.drag_data["start_y"] = event.y_root
+
+        # Create floating drag label
+        if self.drag_label:
+            self.drag_label.destroy()
+
+        self.drag_label = tk.Toplevel(self.root)
+        self.drag_label.overrideredirect(True)  # No window decorations
+        self.drag_label.attributes('-alpha', 0.7)  # Semi-transparent
+        self.drag_label.attributes('-topmost', True)
+
+        # Show mini version of the image
+        label = tk.Label(self.drag_label, image=photo, bg='white', relief=tk.RAISED, bd=2)
+        label.pack()
+        label.image = photo  # Keep reference
+
+        self.drag_label.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+
+    def do_drag(self, event):
+        """Handle drag motion"""
+        if self.drag_data["filepath"] and self.drag_label:
+            # Move the floating label
+            self.drag_label.geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
+
+            # Check if hovering over a drop target
+            for folder_name, btn in self.folder_drop_targets.items():
+                try:
+                    bx = btn.winfo_rootx()
+                    by = btn.winfo_rooty()
+                    bw = btn.winfo_width()
+                    bh = btn.winfo_height()
+
+                    if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
+                        # Highlight this button
+                        btn.configure(bg='#4CAF50', fg='white')
+                    else:
+                        # Reset to normal (check if it's the selected folder)
+                        is_selected = self.current_folder == folder_name
+                        if folder_name is None:
+                            btn.configure(bg='#e0e0e0' if self.current_folder is None else '#f5f5f5', fg='#333')
+                        else:
+                            btn.configure(
+                                bg='#4a90d9' if is_selected else '#f5f5f5',
+                                fg='white' if is_selected else '#333'
+                            )
+                except:
+                    pass
+
+    def end_drag(self, event):
+        """End drag and check for drop target"""
+        if not self.drag_data["filepath"]:
+            return
+
+        filepath = self.drag_data["filepath"]
+        dropped = False
+
+        # Check if dropped on a folder button
+        for folder_name, btn in self.folder_drop_targets.items():
+            try:
+                bx = btn.winfo_rootx()
+                by = btn.winfo_rooty()
+                bw = btn.winfo_width()
+                bh = btn.winfo_height()
+
+                if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
+                    # Get current folder of this file
+                    current_folder = None
+                    if filepath.parent != self.save_dir:
+                        current_folder = filepath.parent.name
+
+                    # Only move if different folder
+                    if folder_name != current_folder:
+                        self.move_to_folder(filepath, folder_name)
+                    dropped = True
+                    break
+            except:
+                pass
+
+        # Clean up
+        if self.drag_label:
+            self.drag_label.destroy()
+            self.drag_label = None
+        self.drag_data["filepath"] = None
+
+        # Reset button colors
+        self.refresh_folder_bar()
+
+    # ==================== END FOLDER MANAGEMENT ====================
+
     def refresh_gallery(self):
         # Update disk usage display
         self.update_disk_usage()
@@ -1307,13 +2271,27 @@ class ScreenshotTool:
         for widget in self.gallery_frame.winfo_children():
             widget.destroy()
 
-        # Get list of screenshots
+        # Get list of screenshots based on current folder filter
         try:
-            screenshots = sorted(
-                self.save_dir.glob("screenshot_*.png"),
-                key=lambda x: x.stat().st_mtime,
-                reverse=True
-            )[:20]  # Show last 20 screenshots
+            if self.current_folder:
+                # Show only images in selected folder
+                search_dir = self.save_dir / self.current_folder
+                screenshots = sorted(
+                    search_dir.glob("*.png"),
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True
+                )[:30]
+            else:
+                # Show all images (root + subfolders)
+                all_images = list(self.save_dir.glob("*.png"))
+                # Also include images from subfolders
+                for folder in self.get_folders():
+                    all_images.extend((self.save_dir / folder).glob("*.png"))
+                screenshots = sorted(
+                    all_images,
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True
+                )[:30]
         except Exception as e:
             print(f"Error reading screenshots: {e}")
             screenshots = []
@@ -1338,7 +2316,7 @@ class ScreenshotTool:
         row_frame = None
         for i, screenshot_path in enumerate(screenshots):
             if i % thumbs_per_row == 0:
-                row_frame = ttk.Frame(self.gallery_frame)
+                row_frame = tk.Frame(self.gallery_frame, bg='#f5f5f5')
                 row_frame.pack(fill=tk.X, pady=5)
 
             try:
@@ -1357,59 +2335,141 @@ class ScreenshotTool:
                 img_container = tk.Frame(thumb_frame, bg='white')
                 img_container.pack()
 
-                # Create clickable thumbnail
+                # Create clickable thumbnail with drag support
                 thumb_label = tk.Label(img_container, image=photo, cursor="hand2", bg='white')
                 thumb_label.pack()
-                thumb_label.bind("<Button-1>", lambda e, p=screenshot_path: self.open_image(p))
 
-                # Create overlay frame for hover menu - transparent container
-                overlay = tk.Frame(img_container)
+                # Drag and drop bindings
+                def make_drag_handlers(path, img_photo):
+                    drag_started = [False]
+                    start_pos = [0, 0]
 
-                # Menu buttons - compact, same width, no border
-                btn_style = {'font': ("", 7), 'cursor': "hand2", 'relief': tk.FLAT,
-                             'fg': 'white', 'pady': 2, 'bd': 0, 'width': 5,
-                             'highlightthickness': 0, 'activeforeground': 'white'}
+                    def on_press(e):
+                        start_pos[0] = e.x_root
+                        start_pos[1] = e.y_root
+                        drag_started[0] = False
 
-                btn_open = tk.Button(
-                    overlay, text="Open", bg='#4CAF50', activebackground='#45a049', **btn_style,
-                    command=lambda p=screenshot_path: self.open_image(p)
-                )
-                btn_edit = tk.Button(
-                    overlay, text="Edit", bg='#9C27B0', activebackground='#7B1FA2', **btn_style,
-                    command=lambda p=screenshot_path: self.edit_screenshot(p)
-                )
-                btn_copy = tk.Button(
-                    overlay, text="Copy", bg='#2196F3', activebackground='#1976D2', **btn_style,
-                    command=lambda p=screenshot_path: self.copy_file_to_clipboard(p)
-                )
-                btn_delete = tk.Button(
-                    overlay, text="Del", bg='#f44336', activebackground='#d32f2f', **btn_style,
-                    command=lambda p=screenshot_path: self.delete_screenshot(p)
-                )
+                    def on_motion(e):
+                        # Start drag if moved more than 5 pixels
+                        if not drag_started[0]:
+                            dx = abs(e.x_root - start_pos[0])
+                            dy = abs(e.y_root - start_pos[1])
+                            if dx > 5 or dy > 5:
+                                drag_started[0] = True
+                                self.start_drag(e, path, img_photo)
+                        else:
+                            self.do_drag(e)
 
-                btn_open.pack(pady=1)
-                btn_edit.pack(pady=1)
-                btn_copy.pack(pady=1)
-                btn_delete.pack(pady=1)
+                    def on_release(e):
+                        if drag_started[0]:
+                            self.end_drag(e)
+                        else:
+                            self.open_image(path)
 
-                # Hover enter/leave functions - center the buttons
-                def on_enter(e, ol=overlay):
-                    ol.place(relx=0.5, rely=0.5, anchor='center')
+                    return on_press, on_motion, on_release
 
-                def on_leave(e, ol=overlay):
-                    ol.place_forget()
+                press_h, motion_h, release_h = make_drag_handlers(screenshot_path, photo)
+                thumb_label.bind("<Button-1>", press_h)
+                thumb_label.bind("<B1-Motion>", motion_h)
+                thumb_label.bind("<ButtonRelease-1>", release_h)
 
-                # Bind hover events to the container
-                img_container.bind("<Enter>", on_enter)
-                img_container.bind("<Leave>", on_leave)
+                # Create hover menu handlers with floating overlay
+                def create_hover_handlers(container, path):
+                    overlay_window = None
+                    hide_timer = None
 
-                # Filename label
-                name_label = ttk.Label(
-                    thumb_frame,
-                    text=screenshot_path.name[:15] + "...",
-                    font=("", 8)
-                )
-                name_label.pack()
+                    def show_overlay(e):
+                        nonlocal overlay_window, hide_timer
+
+                        # Cancel any pending hide
+                        if hide_timer:
+                            container.after_cancel(hide_timer)
+                            hide_timer = None
+
+                        if overlay_window:
+                            return
+
+                        # Create floating toplevel window
+                        overlay_window = tk.Toplevel(self.root)
+                        overlay_window.overrideredirect(True)
+                        overlay_window.attributes('-topmost', True)
+
+                        # Menu buttons - simple monochrome style
+                        btn_style = {'font': ("Segoe UI", 8), 'cursor': "hand2", 'relief': tk.FLAT,
+                                     'fg': '#333', 'pady': 3, 'bd': 0, 'width': 8,
+                                     'highlightthickness': 0, 'activeforeground': '#000',
+                                     'bg': '#e8e8e8', 'activebackground': '#d0d0d0'}
+
+                        frame = tk.Frame(overlay_window, bg='white', relief=tk.SOLID, bd=1)
+                        frame.pack()
+
+                        def close_and_run(func):
+                            def wrapper():
+                                hide_overlay_now()
+                                func()
+                            return wrapper
+
+                        tk.Button(frame, text="Open", **btn_style,
+                                 command=close_and_run(lambda: self.open_image(path))).pack(pady=1, padx=2)
+                        tk.Button(frame, text="Edit", **btn_style,
+                                 command=close_and_run(lambda: self.edit_screenshot(path))).pack(pady=1, padx=2)
+                        tk.Button(frame, text="Copy", **btn_style,
+                                 command=close_and_run(lambda: self.copy_file_to_clipboard(path))).pack(pady=1, padx=2)
+
+                        def show_send_popup(e):
+                            menu = tk.Menu(self.root, tearoff=0)
+                            for target in self.push_targets:
+                                if target.get('enabled', True):
+                                    menu.add_command(label=target['name'],
+                                                   command=lambda p=path, t=target['name']: self.send_to_target(p, t))
+                            menu.post(e.x_root, e.y_root)
+                            hide_overlay_now()
+
+                        send_btn = tk.Button(frame, text="Send", **btn_style)
+                        send_btn.bind("<Button-1>", show_send_popup)
+                        send_btn.pack(pady=1, padx=2)
+
+                        move_btn = tk.Button(frame, text="Move", **btn_style)
+                        move_btn.bind("<Button-1>", lambda e: (self.show_move_menu(e, path), hide_overlay_now()))
+                        move_btn.pack(pady=1, padx=2)
+
+                        tk.Button(frame, text="Delete", **btn_style,
+                                 command=close_and_run(lambda: self.delete_screenshot(path))).pack(pady=1, padx=2)
+
+                        # Position overlay centered over the thumbnail
+                        container.update_idletasks()
+                        x = container.winfo_rootx() + container.winfo_width() // 2
+                        y = container.winfo_rooty() + container.winfo_height() // 2
+                        overlay_window.update_idletasks()
+                        overlay_window.geometry(f"+{x - overlay_window.winfo_reqwidth()//2}+{y - overlay_window.winfo_reqheight()//2}")
+
+                        # Keep overlay visible when mouse is over it
+                        overlay_window.bind("<Enter>", lambda e: cancel_hide())
+                        overlay_window.bind("<Leave>", lambda e: schedule_hide())
+
+                    def cancel_hide():
+                        nonlocal hide_timer
+                        if hide_timer:
+                            container.after_cancel(hide_timer)
+                            hide_timer = None
+
+                    def schedule_hide():
+                        nonlocal hide_timer
+                        hide_timer = container.after(100, hide_overlay_now)
+
+                    def hide_overlay_now():
+                        nonlocal overlay_window, hide_timer
+                        if hide_timer:
+                            container.after_cancel(hide_timer)
+                            hide_timer = None
+                        if overlay_window:
+                            overlay_window.destroy()
+                            overlay_window = None
+
+                    container.bind("<Enter>", show_overlay)
+                    container.bind("<Leave>", lambda e: schedule_hide())
+
+                create_hover_handlers(img_container, screenshot_path)
 
             except Exception as e:
                 print(f"Error loading thumbnail {screenshot_path}: {e}")
@@ -1464,7 +2524,7 @@ class ScreenshotTool:
         settings_win.resizable(False, False)
 
         # Center on parent
-        settings_win.geometry("350x520")
+        settings_win.geometry("350x700")
         settings_win.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() - settings_win.winfo_width()) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - settings_win.winfo_height()) // 2
@@ -1473,6 +2533,18 @@ class ScreenshotTool:
         # Main container with padding
         frame = ttk.Frame(settings_win, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
+
+        # Exit button reference (will be created at bottom, but need reference for callbacks)
+        exit_btn_var = tk.StringVar(value="Exit")
+
+        def mark_saved():
+            """Update exit button to show changes were saved"""
+            exit_btn_var.set("Exit - changes saved")
+
+        def save_and_mark():
+            """Save settings and update button"""
+            self.save_push_targets()
+            mark_saved()
 
         # Capture Mode
         mode_frame = ttk.Frame(frame)
@@ -1486,6 +2558,7 @@ class ScreenshotTool:
             width=15
         )
         mode_combo.pack(side=tk.LEFT, padx=(10, 0))
+        mode_combo.bind("<<ComboboxSelected>>", lambda e: mark_saved())
 
         # Capture button for manual capture
         capture_btn = ttk.Button(mode_frame, text="Capture", command=self.do_capture, width=8)
@@ -1503,24 +2576,73 @@ class ScreenshotTool:
             width=15
         )
         delay_combo.pack(side=tk.LEFT, padx=(10, 0))
+        delay_combo.bind("<<ComboboxSelected>>", lambda e: mark_saved())
 
-        # Checkboxes
-        check_frame = ttk.Frame(frame)
-        check_frame.pack(fill=tk.X, pady=(0, 15))
-
+        # Edit before save checkbox
         edit_check = ttk.Checkbutton(
-            check_frame,
+            frame,
             text="Edit before save (open editor after capture)",
-            variable=self.edit_before_save
+            variable=self.edit_before_save,
+            command=save_and_mark
         )
-        edit_check.pack(anchor=tk.W, pady=2)
+        edit_check.pack(anchor=tk.W, pady=(0, 5))
 
-        paste_check = ttk.Checkbutton(
-            check_frame,
-            text="Auto-paste to VSCode Claude",
-            variable=self.auto_paste_claude
+        # Pin to all desktops checkbox
+        def toggle_pin_and_mark():
+            self.toggle_pin()
+            mark_saved()
+
+        pin_check = ttk.Checkbutton(
+            frame,
+            text="Show on all virtual desktops",
+            variable=self.pin_to_all_desktops,
+            command=toggle_pin_and_mark
         )
-        paste_check.pack(anchor=tk.W, pady=2)
+        pin_check.pack(anchor=tk.W, pady=(0, 5))
+
+        # Silent capture checkbox - stay on current desktop after capture
+        silent_check = ttk.Checkbutton(
+            frame,
+            text="Silent capture (stay on current desktop)",
+            variable=self.silent_capture,
+            command=save_and_mark
+        )
+        silent_check.pack(anchor=tk.W, pady=(0, 10))
+
+        # Auto-send section
+        auto_send_frame = ttk.Frame(frame)
+        auto_send_frame.pack(fill=tk.X, pady=(0, 15))
+
+        auto_send_check = ttk.Checkbutton(
+            auto_send_frame,
+            text="Auto-send to:",
+            variable=self.auto_send_enabled,
+            command=save_and_mark
+        )
+        auto_send_check.pack(side=tk.LEFT)
+
+        # Get list of enabled target names
+        target_names = [t['name'] for t in self.push_targets if t.get('enabled', True)]
+
+        # Set default if not set or invalid
+        if self.auto_send_target.get() not in target_names and target_names:
+            self.auto_send_target.set(target_names[0])
+
+        def on_target_change(event=None):
+            save_and_mark()
+
+        target_combo = ttk.Combobox(
+            auto_send_frame,
+            textvariable=self.auto_send_target,
+            values=target_names,
+            state="readonly",
+            width=20
+        )
+        target_combo.pack(side=tk.LEFT, padx=(5, 0))
+        target_combo.bind("<<ComboboxSelected>>", on_target_change)  # Save when changed
+
+        # Store reference for refreshing after adding new targets
+        self._target_combo = target_combo
 
         # Thumbnail size slider
         thumb_frame = ttk.Frame(frame)
@@ -1544,8 +2666,11 @@ class ScreenshotTool:
             command=update_size_label  # Just update label while dragging
         )
         thumb_slider.pack(side=tk.LEFT, padx=(10, 5))
-        # Refresh gallery only when slider is released
-        thumb_slider.bind("<ButtonRelease-1>", lambda e: self.refresh_gallery())
+        # Refresh gallery only when slider is released, and mark as saved
+        def on_slider_release(e):
+            self.refresh_gallery()
+            mark_saved()
+        thumb_slider.bind("<ButtonRelease-1>", on_slider_release)
         size_label.pack(side=tk.LEFT)
         update_size_label()
 
@@ -1564,7 +2689,10 @@ class ScreenshotTool:
             width=10
         )
         limit_combo.pack(side=tk.LEFT, padx=(10, 0))
-        limit_combo.bind("<<ComboboxSelected>>", lambda e: self.update_disk_usage(show_warning=False))
+        def on_limit_change(e):
+            self.update_disk_usage(show_warning=False)
+            mark_saved()
+        limit_combo.bind("<<ComboboxSelected>>", on_limit_change)
 
         # Archive days
         archive_frame = ttk.Frame(storage_frame)
@@ -1577,6 +2705,7 @@ class ScreenshotTool:
             width=10
         )
         archive_combo.pack(side=tk.LEFT, padx=(10, 0))
+        archive_combo.bind("<<ComboboxSelected>>", lambda e: mark_saved())
         ttk.Label(archive_frame, text="days").pack(side=tk.LEFT, padx=(5, 0))
 
         # Manual cleanup button
@@ -1586,6 +2715,44 @@ class ScreenshotTool:
             command=self.manual_cleanup
         )
         cleanup_btn.pack(pady=(5, 0))
+
+        # Push Targets section
+        targets_frame = ttk.LabelFrame(frame, text="Push Targets", padding="10")
+        targets_frame.pack(fill=tk.X, pady=(0, 15))
+
+        # List current targets
+        targets_list = tk.Listbox(targets_frame, height=3, font=("", 9))
+        for target in self.push_targets:
+            status = "✓" if target.get('enabled', True) else "✗"
+            targets_list.insert(tk.END, f"{status} {target['name']}")
+        targets_list.pack(fill=tk.X, pady=(0, 10))
+
+        targets_btn_frame = ttk.Frame(targets_frame)
+        targets_btn_frame.pack(fill=tk.X)
+
+        def refresh_targets_list():
+            targets_list.delete(0, tk.END)
+            for target in self.push_targets:
+                status = "✓" if target.get('enabled', True) else "✗"
+                targets_list.insert(tk.END, f"{status} {target['name']}")
+            # Also update the auto-send dropdown
+            new_target_names = [t['name'] for t in self.push_targets if t.get('enabled', True)]
+            target_combo['values'] = new_target_names
+            if self.auto_send_target.get() not in new_target_names and new_target_names:
+                self.auto_send_target.set(new_target_names[0])
+
+        def delete_selected_target():
+            sel = targets_list.curselection()
+            if sel:
+                idx = sel[0]
+                name = self.push_targets[idx]['name']
+                if messagebox.askyesno("Delete Target", f"Delete '{name}'?"):
+                    del self.push_targets[idx]
+                    self.save_push_targets()
+                    refresh_targets_list()
+
+        ttk.Button(targets_btn_frame, text="Add New", command=lambda: self.register_new_target(refresh_targets_list)).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(targets_btn_frame, text="Delete", command=delete_selected_target).pack(side=tk.LEFT)
 
         # Save location
         loc_frame = ttk.LabelFrame(frame, text="Save Location", padding="10")
@@ -1600,8 +2767,9 @@ class ScreenshotTool:
         ttk.Button(btn_frame, text="Change...", command=self.change_save_dir).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(btn_frame, text="Open Folder", command=self.open_save_folder).pack(side=tk.LEFT)
 
-        # Close button
-        ttk.Button(frame, text="Close", command=settings_win.destroy).pack(pady=(10, 0))
+        # Exit button (text changes when settings are saved)
+        exit_btn = ttk.Button(frame, textvariable=exit_btn_var, command=settings_win.destroy, width=20)
+        exit_btn.pack(pady=(10, 0))
 
     def change_save_dir(self):
         """Change the save directory"""
@@ -1627,7 +2795,11 @@ class ScreenshotTool:
         print(f"Hotkeys:")
         print(f"  {self.hotkey_region} - Capture region")
         print(f"  {self.hotkey_full} - Capture full screen")
-        print(f"\nTip: Enable 'Auto-paste to VSCode Claude' to automatically send screenshots to Claude!")
+        print(f"\nTip: Enable 'Auto-send' in Settings to automatically send screenshots to your preferred app!")
+
+        # Auto-open settings on startup so user can see current config
+        self.root.after(100, self.show_settings)
+
         self.root.mainloop()
 
 
