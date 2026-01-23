@@ -237,37 +237,40 @@ class WindowSelector:
 
 
 class ScrollingCapture:
-    """Captures a scrollable window by automatically scrolling and stitching screenshots"""
+    """Captures a scrollable region by automatically scrolling and stitching screenshots"""
 
-    def __init__(self, hwnd, callback, scroll_delay=0.2, max_iterations=50):
-        self.hwnd = hwnd
+    def __init__(self, left, top, width, height, callback, scroll_delay=0.2, max_iterations=50):
+        self.left = left
+        self.top = top
+        self.width = width
+        self.height = height
         self.callback = callback
         self.scroll_delay = scroll_delay
         self.max_iterations = max_iterations
         self.screenshots = []
         self.cancelled = False
 
-        # Create progress window
+        # Create progress window positioned at bottom-right corner (outside capture area)
         self.create_progress_window()
 
         # Start capture in background
         import threading
-        self.thread = threading.Thread(target=self.capture_scrolling_window)
+        self.thread = threading.Thread(target=self.capture_scrolling_region)
         self.thread.daemon = True
         self.thread.start()
 
     def create_progress_window(self):
-        """Create floating progress window"""
+        """Create floating progress window at bottom-right corner"""
         self.progress_window = tk.Toplevel()
         self.progress_window.title("Scrolling Capture")
-        self.progress_window.geometry("300x120")
+        self.progress_window.geometry("280x100")
         self.progress_window.attributes('-topmost', True)
         self.progress_window.resizable(False, False)
 
-        frame = ttk.Frame(self.progress_window, padding="20")
+        frame = ttk.Frame(self.progress_window, padding="15")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        self.progress_label = ttk.Label(frame, text="Starting capture...\nDO NOT interact with the window!",
+        self.progress_label = ttk.Label(frame, text="Starting capture...\nDO NOT scroll or click!",
                                         font=("", 9), justify=tk.CENTER)
         self.progress_label.pack(pady=(0, 10))
 
@@ -275,10 +278,12 @@ class ScrollingCapture:
 
         self.progress_window.protocol("WM_DELETE_WINDOW", self.cancel)
 
-        # Center on screen
+        # Position at bottom-right corner of screen
         self.progress_window.update_idletasks()
-        x = (self.progress_window.winfo_screenwidth() - 300) // 2
-        y = (self.progress_window.winfo_screenheight() - 120) // 2
+        screen_width = self.progress_window.winfo_screenwidth()
+        screen_height = self.progress_window.winfo_screenheight()
+        x = screen_width - 300  # 20px margin from right edge
+        y = screen_height - 150  # 30px margin from bottom
         self.progress_window.geometry(f"+{x}+{y}")
 
     def update_progress(self, message):
@@ -298,34 +303,17 @@ class ScrollingCapture:
             pass
         self.callback(None)
 
-    def capture_scrolling_window(self):
-        """Main capture loop"""
-        import win32gui
-        import win32con
-
+    def capture_scrolling_region(self):
+        """Main capture loop for the selected region"""
         try:
-            # Get window rect
-            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
-            width = right - left
-            height = bottom - top
-
-            if height < 200:
-                self.update_progress("Window too small for scrolling capture")
+            if self.height < 100:
+                self.update_progress("Region too small for scrolling capture")
                 time.sleep(2)
                 self.cancel()
                 return
 
-            # Focus the window
-            try:
-                if win32gui.IsIconic(self.hwnd):
-                    win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
-                win32gui.SetForegroundWindow(self.hwnd)
-                time.sleep(0.3)
-            except:
-                pass
-
-            # Give window time to come to foreground
-            time.sleep(0.5)
+            # Brief pause before starting
+            time.sleep(0.3)
 
             identical_count = 0
 
@@ -336,7 +324,7 @@ class ScrollingCapture:
                 self.update_progress(f"Capturing section {i + 1}...")
 
                 # Capture current view
-                screenshot = self.capture_window_region(left, top, width, height)
+                screenshot = self.capture_region(self.left, self.top, self.width, self.height)
 
                 if screenshot:
                     # Check if identical to previous
@@ -382,8 +370,8 @@ class ScrollingCapture:
             time.sleep(3)
             self.cancel()
 
-    def capture_window_region(self, left, top, width, height):
-        """Capture a window region using mss"""
+    def capture_region(self, left, top, width, height):
+        """Capture a screen region using mss"""
         try:
             with mss.mss() as sct:
                 monitor = {"top": top, "left": left, "width": width, "height": height}
@@ -391,7 +379,7 @@ class ScrollingCapture:
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
                 return img
         except Exception as e:
-            print(f"Error capturing window region: {e}")
+            print(f"Error capturing region: {e}")
             return None
 
     def is_identical(self, img1, img2):
@@ -1348,7 +1336,7 @@ class ScreenshotTool:
         self.root.after(0, self.start_scrolling_capture)
 
     def start_scrolling_capture(self):
-        """Start the scrolling window capture process"""
+        """Start the scrolling region capture process"""
         delay = int(self.delay_var.get())
 
         if delay > 0:
@@ -1356,35 +1344,48 @@ class ScreenshotTool:
             self.root.iconify()
             self.root.after(200, lambda: DelayCountdown(delay, self._on_scrolling_delay_complete))
         else:
-            self.status_var.set("Click on a window for scrolling capture...")
+            self.status_var.set("Select the scrollable region to capture...")
             self.root.update()
             self.root.iconify()
-            self.root.after(200, self._show_scrolling_window_selector)
+            self.root.after(200, self._show_scrolling_region_selector)
 
     def _on_scrolling_delay_complete(self, proceed):
         """Called when scrolling delay countdown finishes"""
         if proceed:
-            self._show_scrolling_window_selector()
+            self._show_scrolling_region_selector()
         else:
             self.root.deiconify()
             self.status_var.set("Capture cancelled")
 
-    def _show_scrolling_window_selector(self):
-        """Show the window selector overlay for scrolling capture"""
-        WindowSelector(self.on_scrolling_window_selected)
+    def _show_scrolling_region_selector(self):
+        """Show the region selector overlay for scrolling capture"""
+        RegionSelector(self.on_scrolling_region_selected)
 
-    def on_scrolling_window_selected(self, hwnd):
-        """Called when window selection is complete for scrolling capture"""
+    def on_scrolling_region_selected(self, coords, cropped_img):
+        """Called when region selection is complete for scrolling capture"""
         self._capture_in_progress = False
 
-        if hwnd is None:
+        if coords is None:
             self.status_var.set("Scrolling capture cancelled")
             if not self.silent_capture.get():
                 self.root.deiconify()
             return
 
+        # Extract region coordinates
+        x1, y1, x2, y2 = coords
+        left = min(x1, x2)
+        top = min(y1, y2)
+        width = abs(x2 - x1)
+        height = abs(y2 - y1)
+
+        if width < 50 or height < 50:
+            self.status_var.set("Region too small for scrolling capture")
+            if not self.silent_capture.get():
+                self.root.deiconify()
+            return
+
         # Start scrolling capture with progress window
-        ScrollingCapture(hwnd, self.on_scrolling_capture_complete,
+        ScrollingCapture(left, top, width, height, self.on_scrolling_capture_complete,
                         scroll_delay=0.2, max_iterations=50)
 
     def on_scrolling_capture_complete(self, image):
