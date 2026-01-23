@@ -395,34 +395,50 @@ class ScrollingCapture:
             return None
 
     def is_identical(self, img1, img2):
-        """Check if two images are identical (for detecting scroll end)"""
+        """Detect if page actually scrolled by finding matching content between images"""
         try:
-            from PIL import ImageStat, ImageChops
+            from PIL import ImageChops, ImageStat
 
-            # Compare full images to detect if scroll didn't move
-            # Convert to same size if needed
             if img1.size != img2.size:
                 return False
 
-            # Calculate difference between entire images
-            diff_img = ImageChops.difference(img1, img2)
-            stat = ImageStat.Stat(diff_img)
+            width, height = img1.size
 
-            # Sum of mean differences across all channels (R, G, B)
-            # If images are identical, this will be very close to 0
-            total_diff = sum(stat.mean)
+            # Smart detection: When a page scrolls, the bottom portion of the previous
+            # capture should appear at the top of the next capture.
+            # We test different overlap percentages to find if ANY content moved up.
 
-            # More lenient threshold - accounts for minor rendering differences,
-            # timestamps, animations, etc. Typical identical scroll = < 5
-            is_same = total_diff < 10.0
+            best_match_score = float('inf')
 
-            # Debug output
-            if is_same:
-                print(f"Identical images detected! Diff: {total_diff:.2f}")
+            for overlap_percent in [20, 30, 40, 50, 60, 70, 80, 90]:
+                overlap_px = int(height * overlap_percent / 100)
 
-            return is_same
+                if overlap_px < 10:  # Too small to compare
+                    continue
+
+                # Bottom portion of img1
+                crop1 = img1.crop((0, height - overlap_px, width, height))
+                # Top portion of img2
+                crop2 = img2.crop((0, 0, width, overlap_px))
+
+                # Compare these regions
+                diff = ImageChops.difference(crop1, crop2)
+                stat = ImageStat.Stat(diff)
+                similarity_score = sum(stat.mean)  # Lower = more similar
+
+                best_match_score = min(best_match_score, similarity_score)
+
+                # If we find a good match, content scrolled from img1 to img2
+                if similarity_score < 8.0:
+                    print(f"✓ Scroll detected (overlap: {overlap_percent}%, score: {similarity_score:.2f})")
+                    return False  # Not identical - page scrolled
+
+            # No matching content found = page didn't scroll = at the end
+            print(f"✗ No scroll detected (best score: {best_match_score:.2f}) - AT BOTTOM!")
+            return True
+
         except Exception as e:
-            print(f"Error comparing images: {e}")
+            print(f"Error in scroll detection: {e}")
             return False
 
     def find_overlap(self, img1, img2):
@@ -468,24 +484,35 @@ class ScrollingCapture:
         # Calculate final dimensions
         width = self.screenshots[0].width
 
-        # Start with first image
+        # Start with first image (includes header)
         result = self.screenshots[0].copy()
 
-        # Stitch subsequent images
+        # Stitch subsequent images - only the NEW content portion
         for i in range(1, len(self.screenshots)):
             overlap = self.find_overlap(self.screenshots[i-1], self.screenshots[i])
 
+            # Crop the new screenshot to only include content BELOW the overlap
+            # This removes the repeated header/fixed content
+            new_content = self.screenshots[i].crop((
+                0,
+                overlap,  # Start from below the overlap
+                self.screenshots[i].width,
+                self.screenshots[i].height
+            ))
+
             # Create new image with additional height
-            new_height = result.height + self.screenshots[i].height - overlap
+            new_height = result.height + new_content.height
             new_result = Image.new('RGB', (width, new_height))
 
             # Paste existing result
             new_result.paste(result, (0, 0))
 
-            # Paste new section
-            new_result.paste(self.screenshots[i], (0, result.height - overlap))
+            # Paste only the new content at the bottom
+            new_result.paste(new_content, (0, result.height))
 
             result = new_result
+
+            print(f"Stitched section {i}: overlap={overlap}px, new_content={new_content.height}px")
 
         return result
 
