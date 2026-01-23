@@ -236,6 +236,264 @@ class WindowSelector:
         self.callback(None)
 
 
+class ScrollingCapture:
+    """Captures a scrollable window by automatically scrolling and stitching screenshots"""
+
+    def __init__(self, hwnd, callback, scroll_delay=0.2, max_iterations=50):
+        self.hwnd = hwnd
+        self.callback = callback
+        self.scroll_delay = scroll_delay
+        self.max_iterations = max_iterations
+        self.screenshots = []
+        self.cancelled = False
+
+        # Create progress window
+        self.create_progress_window()
+
+        # Start capture in background
+        import threading
+        self.thread = threading.Thread(target=self.capture_scrolling_window)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def create_progress_window(self):
+        """Create floating progress window"""
+        self.progress_window = tk.Toplevel()
+        self.progress_window.title("Scrolling Capture")
+        self.progress_window.geometry("300x120")
+        self.progress_window.attributes('-topmost', True)
+        self.progress_window.resizable(False, False)
+
+        frame = ttk.Frame(self.progress_window, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        self.progress_label = ttk.Label(frame, text="Preparing...", font=("", 10))
+        self.progress_label.pack(pady=(0, 10))
+
+        ttk.Button(frame, text="Cancel", command=self.cancel).pack()
+
+        self.progress_window.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        # Center on screen
+        self.progress_window.update_idletasks()
+        x = (self.progress_window.winfo_screenwidth() - 300) // 2
+        y = (self.progress_window.winfo_screenheight() - 120) // 2
+        self.progress_window.geometry(f"+{x}+{y}")
+
+    def update_progress(self, message):
+        """Update progress label"""
+        try:
+            self.progress_label.config(text=message)
+            self.progress_window.update()
+        except:
+            pass
+
+    def cancel(self):
+        """Cancel the scrolling capture"""
+        self.cancelled = True
+        try:
+            self.progress_window.destroy()
+        except:
+            pass
+        self.callback(None)
+
+    def capture_scrolling_window(self):
+        """Main capture loop"""
+        import win32gui
+        import win32con
+
+        try:
+            # Get window rect
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            width = right - left
+            height = bottom - top
+
+            if height < 200:
+                self.update_progress("Window too small for scrolling capture")
+                time.sleep(2)
+                self.cancel()
+                return
+
+            # Focus the window
+            try:
+                if win32gui.IsIconic(self.hwnd):
+                    win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(self.hwnd)
+                time.sleep(0.3)
+            except:
+                pass
+
+            # Move mouse to center of window
+            center_x = left + width // 2
+            center_y = top + height // 2
+            pyautogui.moveTo(center_x, center_y)
+            time.sleep(0.1)
+
+            # Click to ensure focus
+            pyautogui.click()
+            time.sleep(0.2)
+
+            identical_count = 0
+
+            for i in range(self.max_iterations):
+                if self.cancelled:
+                    return
+
+                self.update_progress(f"Capturing section {i + 1}...")
+
+                # Capture current view
+                screenshot = self.capture_window_region(left, top, width, height)
+
+                if screenshot:
+                    # Check if identical to previous
+                    if self.screenshots and self.is_identical(self.screenshots[-1], screenshot):
+                        identical_count += 1
+                        if identical_count >= 2:
+                            # Reached bottom
+                            self.update_progress(f"Completed! Stitching {len(self.screenshots)} sections...")
+                            break
+                    else:
+                        identical_count = 0
+                        self.screenshots.append(screenshot)
+
+                if i < self.max_iterations - 1:
+                    # Scroll down
+                    pyautogui.press('pagedown')
+                    time.sleep(self.scroll_delay)
+
+            if not self.screenshots:
+                self.update_progress("No screenshots captured")
+                time.sleep(2)
+                self.cancel()
+                return
+
+            # Stitch images
+            self.update_progress(f"Stitching {len(self.screenshots)} sections...")
+            final_image = self.stitch_images()
+
+            # Close progress window
+            try:
+                self.progress_window.destroy()
+            except:
+                pass
+
+            # Return stitched image
+            self.callback(final_image)
+
+        except Exception as e:
+            print(f"Error in scrolling capture: {e}")
+            import traceback
+            traceback.print_exc()
+            self.update_progress(f"Error: {str(e)}")
+            time.sleep(3)
+            self.cancel()
+
+    def capture_window_region(self, left, top, width, height):
+        """Capture a window region using mss"""
+        try:
+            with mss.mss() as sct:
+                monitor = {"top": top, "left": left, "width": width, "height": height}
+                screenshot = sct.grab(monitor)
+                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+                return img
+        except Exception as e:
+            print(f"Error capturing window region: {e}")
+            return None
+
+    def is_identical(self, img1, img2):
+        """Check if two images are identical (for detecting scroll end)"""
+        try:
+            # Compare image hashes for speed
+            from PIL import ImageStat
+
+            # Get bottom 30% of img1 and top 30% of img2
+            h1 = img1.height
+            h2 = img2.height
+
+            crop1 = img1.crop((0, int(h1 * 0.7), img1.width, h1))
+            crop2 = img2.crop((0, 0, img2.width, int(h2 * 0.3)))
+
+            # Resize to same size for comparison
+            if crop1.size != crop2.size:
+                crop2 = crop2.resize(crop1.size)
+
+            # Compare pixel data
+            stat1 = ImageStat.Stat(crop1)
+            stat2 = ImageStat.Stat(crop2)
+
+            # Compare mean values for each channel
+            diff = sum(abs(a - b) for a, b in zip(stat1.mean, stat2.mean))
+
+            # If difference is very small, images are identical
+            return diff < 1.0
+        except:
+            return False
+
+    def find_overlap(self, img1, img2):
+        """Find overlap region between two images"""
+        try:
+            # Search in bottom 50% of img1 and top 50% of img2
+            h1 = img1.height
+            h2 = img2.height
+
+            # Try different overlap amounts
+            for overlap_pct in [10, 15, 20, 25, 30]:
+                overlap_pixels = int(h1 * overlap_pct / 100)
+
+                # Get regions to compare
+                crop1 = img1.crop((0, h1 - overlap_pixels, img1.width, h1))
+                crop2 = img2.crop((0, 0, img2.width, overlap_pixels))
+
+                if crop1.size != crop2.size:
+                    crop2 = crop2.resize(crop1.size)
+
+                # Compare
+                from PIL import ImageChops, ImageStat
+                diff = ImageChops.difference(crop1, crop2)
+                stat = ImageStat.Stat(diff)
+
+                # If very similar, this is the overlap
+                if sum(stat.mean) < 10:
+                    return overlap_pixels
+
+            # Default: assume 20% scroll distance = 80% overlap
+            return int(h1 * 0.20)
+        except:
+            return int(img1.height * 0.20)
+
+    def stitch_images(self):
+        """Stitch all captured images into one tall image"""
+        if not self.screenshots:
+            return None
+
+        if len(self.screenshots) == 1:
+            return self.screenshots[0]
+
+        # Calculate final dimensions
+        width = self.screenshots[0].width
+
+        # Start with first image
+        result = self.screenshots[0].copy()
+
+        # Stitch subsequent images
+        for i in range(1, len(self.screenshots)):
+            overlap = self.find_overlap(self.screenshots[i-1], self.screenshots[i])
+
+            # Create new image with additional height
+            new_height = result.height + self.screenshots[i].height - overlap
+            new_result = Image.new('RGB', (width, new_height))
+
+            # Paste existing result
+            new_result.paste(result, (0, 0))
+
+            # Paste new section
+            new_result.paste(self.screenshots[i], (0, result.height - overlap))
+
+            result = new_result
+
+        return result
+
+
 class RegionSelector:
     """Fullscreen overlay for selecting a screen region - captures screen first"""
 
@@ -737,6 +995,7 @@ class ScreenshotTool:
         self.hotkey_full = "ctrl+shift+s"
         self.hotkey_region = "ctrl+shift+r"
         self.hotkey_window = "ctrl+shift+w"
+        self.hotkey_scrolling = "ctrl+shift+l"
         self.hotkeys_registered = False
         self._capture_in_progress = False  # Prevent multiple simultaneous captures
 
@@ -818,6 +1077,10 @@ class ScreenshotTool:
         ttk.Button(
             sidebar, text="Window (Ctrl+Shift+W)",
             command=self.start_window_capture, width=btn_width
+        ).pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(
+            sidebar, text="Scrolling (Ctrl+Shift+L)",
+            command=self.start_scrolling_capture, width=btn_width
         ).pack(fill=tk.X, pady=(0, 15))
 
         ttk.Button(
@@ -915,11 +1178,13 @@ class ScreenshotTool:
             keyboard.add_hotkey(self.hotkey_full, self.capture_fullscreen_threadsafe)
             keyboard.add_hotkey(self.hotkey_region, self.start_region_capture_threadsafe)
             keyboard.add_hotkey(self.hotkey_window, self.start_window_capture_threadsafe)
+            keyboard.add_hotkey(self.hotkey_scrolling, self.start_scrolling_capture_threadsafe)
             self.hotkeys_registered = True
             print(f"Global hotkeys registered:")
             print(f"  {self.hotkey_region} - Region capture")
             print(f"  {self.hotkey_full} - Full screen capture")
             print(f"  {self.hotkey_window} - Window capture")
+            print(f"  {self.hotkey_scrolling} - Scrolling capture")
         except Exception as e:
             print(f"Failed to register hotkeys: {e}")
             self.status_var.set(f"Warning: Could not register global hotkeys - {e}")
@@ -930,6 +1195,7 @@ class ScreenshotTool:
                 keyboard.remove_hotkey(self.hotkey_full)
                 keyboard.remove_hotkey(self.hotkey_region)
                 keyboard.remove_hotkey(self.hotkey_window)
+                keyboard.remove_hotkey(self.hotkey_scrolling)
             except:
                 pass
 
@@ -1050,6 +1316,72 @@ class ScreenshotTool:
             self.status_var.set(error_msg)
             print(error_msg)
             messagebox.showerror("Error", error_msg)
+
+    def start_scrolling_capture_threadsafe(self):
+        """Threadsafe wrapper for scrolling capture hotkey"""
+        if self._capture_in_progress:
+            return
+        self._capture_in_progress = True
+        self.root.after(0, self.start_scrolling_capture)
+
+    def start_scrolling_capture(self):
+        """Start the scrolling window capture process"""
+        delay = int(self.delay_var.get())
+
+        if delay > 0:
+            self.status_var.set(f"Countdown: {delay} seconds - set up your screen!")
+            self.root.iconify()
+            self.root.after(200, lambda: DelayCountdown(delay, self._on_scrolling_delay_complete))
+        else:
+            self.status_var.set("Click on a window for scrolling capture...")
+            self.root.update()
+            self.root.iconify()
+            self.root.after(200, self._show_scrolling_window_selector)
+
+    def _on_scrolling_delay_complete(self, proceed):
+        """Called when scrolling delay countdown finishes"""
+        if proceed:
+            self._show_scrolling_window_selector()
+        else:
+            self.root.deiconify()
+            self.status_var.set("Capture cancelled")
+
+    def _show_scrolling_window_selector(self):
+        """Show the window selector overlay for scrolling capture"""
+        WindowSelector(self.on_scrolling_window_selected)
+
+    def on_scrolling_window_selected(self, hwnd):
+        """Called when window selection is complete for scrolling capture"""
+        self._capture_in_progress = False
+
+        if hwnd is None:
+            self.status_var.set("Scrolling capture cancelled")
+            if not self.silent_capture.get():
+                self.root.deiconify()
+            return
+
+        # Start scrolling capture with progress window
+        ScrollingCapture(hwnd, self.on_scrolling_capture_complete,
+                        scroll_delay=0.2, max_iterations=50)
+
+    def on_scrolling_capture_complete(self, image):
+        """Called when scrolling capture is complete"""
+        if image is None:
+            self.status_var.set("Scrolling capture cancelled")
+            if not self.silent_capture.get():
+                self.root.deiconify()
+            return
+
+        # Restore window if not in silent mode
+        if not self.silent_capture.get():
+            self.root.deiconify()
+
+        # Open editor or save directly
+        if self.edit_before_save.get():
+            self.status_var.set("Edit screenshot (add highlights, then Save or Cancel)")
+            ScreenshotEditor(image, self.on_editor_complete)
+        else:
+            self.save_screenshot(image)
 
     def start_region_capture(self):
         """Start the region selection process"""
