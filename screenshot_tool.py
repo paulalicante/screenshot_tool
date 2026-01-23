@@ -237,25 +237,26 @@ class WindowSelector:
 
 
 class ScrollingCapture:
-    """Captures a scrollable region by automatically scrolling and stitching screenshots"""
+    """Captures a scrollable window by auto-detecting and capturing the scrolling region"""
 
-    def __init__(self, left, top, width, height, callback, scroll_delay=0.2, max_iterations=50):
-        self.left = left
-        self.top = top
-        self.width = width
-        self.height = height
+    def __init__(self, hwnd, callback, scroll_delay=0.2, max_iterations=50):
+        self.hwnd = hwnd
         self.callback = callback
         self.scroll_delay = scroll_delay
         self.max_iterations = max_iterations
         self.screenshots = []
         self.cancelled = False
 
-        # Create progress window positioned at bottom-right corner (outside capture area)
+        # Will be set after auto-detection
+        self.scroll_region = None  # (left, top, width, height)
+        self.window_rect = None
+
+        # Minimize progress window and position at bottom-right
         self.create_progress_window()
 
         # Start capture in background
         import threading
-        self.thread = threading.Thread(target=self.capture_scrolling_region)
+        self.thread = threading.Thread(target=self.capture_scrolling_window)
         self.thread.daemon = True
         self.thread.start()
 
@@ -303,35 +304,86 @@ class ScrollingCapture:
             pass
         self.callback(None)
 
-    def capture_scrolling_region(self):
-        """Main capture loop for the selected region"""
+    def capture_scrolling_window(self):
+        """Main capture loop with auto-detection of scrollable region"""
+        import win32gui
+        import win32con
+
         try:
-            if self.height < 100:
-                self.update_progress("Region too small for scrolling capture")
+            # Get window rect
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            width = right - left
+            height = bottom - top
+            self.window_rect = (left, top, width, height)
+
+            if height < 200:
+                self.update_progress("Window too small for scrolling capture")
                 time.sleep(2)
                 self.cancel()
                 return
 
-            # Brief pause before starting
-            time.sleep(0.3)
+            # Focus the window
+            try:
+                if win32gui.IsIconic(self.hwnd):
+                    win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(self.hwnd)
+                time.sleep(0.5)
+            except:
+                pass
 
+            # STEP 1: Capture first full window screenshot
+            self.update_progress("Detecting scrollable region...")
+            first_capture = self.capture_region(left, top, width, height)
+            if not first_capture:
+                self.cancel()
+                return
+
+            # STEP 2: Scroll once
+            pyautogui.press('pagedown')
+            time.sleep(self.scroll_delay)
+
+            # STEP 3: Capture second full window screenshot
+            second_capture = self.capture_region(left, top, width, height)
+            if not second_capture:
+                self.cancel()
+                return
+
+            # STEP 4: Compare to find scrollable region
+            self.scroll_region = self.detect_scrollable_region(first_capture, second_capture)
+
+            if not self.scroll_region:
+                # No scroll detected - use full window
+                self.scroll_region = (0, 0, width, height)
+                print("Could not detect scrollable region, using full window")
+
+            # Add first capture (crop to scroll region)
+            scroll_left, scroll_top, scroll_width, scroll_height = self.scroll_region
+            abs_left = left + scroll_left
+            abs_top = top + scroll_top
+
+            first_cropped = first_capture.crop((scroll_left, scroll_top,
+                                                scroll_left + scroll_width,
+                                                scroll_top + scroll_height))
+            self.screenshots.append(first_cropped)
+
+            # STEP 5: Continue capturing only the scrollable region
             identical_count = 0
 
-            for i in range(self.max_iterations):
+            for i in range(1, self.max_iterations):
                 if self.cancelled:
                     return
 
                 self.update_progress(f"Capturing section {i + 1}...")
 
-                # Capture current view
-                screenshot = self.capture_region(self.left, self.top, self.width, self.height)
+                # Capture only the scrollable region
+                screenshot = self.capture_region(abs_left, abs_top, scroll_width, scroll_height)
 
                 if screenshot:
                     # Check if identical to previous
                     if self.screenshots and self.is_identical(self.screenshots[-1], screenshot):
                         identical_count += 1
                         if identical_count >= 3:
-                            # Reached bottom (3 identical = definitely at end)
+                            # Reached bottom
                             self.update_progress(f"Completed! Stitching {len(self.screenshots)} sections...")
                             break
                     else:
@@ -380,6 +432,49 @@ class ScrollingCapture:
                 return img
         except Exception as e:
             print(f"Error capturing region: {e}")
+            return None
+
+    def detect_scrollable_region(self, img1, img2):
+        """Detect which region changed between two captures (that's the scrollable area)"""
+        try:
+            from PIL import ImageChops, ImageStat
+
+            if img1.size != img2.size:
+                return None
+
+            # Calculate pixel-by-pixel difference
+            diff = ImageChops.difference(img1, img2)
+
+            # Convert to grayscale for easier analysis
+            diff_gray = diff.convert('L')
+
+            # Get bounding box of changed pixels (threshold: pixel changed by > 10)
+            # This filters out minor compression artifacts
+            bbox = diff_gray.point(lambda p: p > 10 and 255).getbbox()
+
+            if not bbox:
+                # No changes detected
+                return None
+
+            left, top, right, bottom = bbox
+            width = right - left
+            height = bottom - top
+
+            # Expand slightly to ensure we capture everything (add 5px margin)
+            left = max(0, left - 5)
+            top = max(0, top - 5)
+            right = min(img1.width, right + 5)
+            bottom = min(img1.height, bottom + 5)
+
+            width = right - left
+            height = bottom - top
+
+            print(f"Detected scrollable region: x={left}, y={top}, w={width}, h={height}")
+
+            return (left, top, width, height)
+
+        except Exception as e:
+            print(f"Error detecting scrollable region: {e}")
             return None
 
     def is_identical(self, img1, img2):
@@ -1344,48 +1439,35 @@ class ScreenshotTool:
             self.root.iconify()
             self.root.after(200, lambda: DelayCountdown(delay, self._on_scrolling_delay_complete))
         else:
-            self.status_var.set("Select the scrollable region to capture...")
+            self.status_var.set("Click on a window for scrolling capture...")
             self.root.update()
             self.root.iconify()
-            self.root.after(200, self._show_scrolling_region_selector)
+            self.root.after(200, self._show_scrolling_window_selector)
 
     def _on_scrolling_delay_complete(self, proceed):
         """Called when scrolling delay countdown finishes"""
         if proceed:
-            self._show_scrolling_region_selector()
+            self._show_scrolling_window_selector()
         else:
             self.root.deiconify()
             self.status_var.set("Capture cancelled")
 
-    def _show_scrolling_region_selector(self):
-        """Show the region selector overlay for scrolling capture"""
-        RegionSelector(self.on_scrolling_region_selected)
+    def _show_scrolling_window_selector(self):
+        """Show the window selector overlay for scrolling capture"""
+        WindowSelector(self.on_scrolling_window_selected)
 
-    def on_scrolling_region_selected(self, coords, cropped_img):
-        """Called when region selection is complete for scrolling capture"""
+    def on_scrolling_window_selected(self, hwnd):
+        """Called when window selection is complete for scrolling capture"""
         self._capture_in_progress = False
 
-        if coords is None:
+        if hwnd is None:
             self.status_var.set("Scrolling capture cancelled")
             if not self.silent_capture.get():
                 self.root.deiconify()
             return
 
-        # Extract region coordinates
-        x1, y1, x2, y2 = coords
-        left = min(x1, x2)
-        top = min(y1, y2)
-        width = abs(x2 - x1)
-        height = abs(y2 - y1)
-
-        if width < 50 or height < 50:
-            self.status_var.set("Region too small for scrolling capture")
-            if not self.silent_capture.get():
-                self.root.deiconify()
-            return
-
-        # Start scrolling capture with progress window
-        ScrollingCapture(left, top, width, height, self.on_scrolling_capture_complete,
+        # Start scrolling capture with auto-detection
+        ScrollingCapture(hwnd, self.on_scrolling_capture_complete,
                         scroll_delay=0.2, max_iterations=50)
 
     def on_scrolling_capture_complete(self, image):
