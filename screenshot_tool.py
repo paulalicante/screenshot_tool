@@ -355,21 +355,24 @@ class ScrollingCapture:
                 # No scroll detected - use full window
                 self.scroll_region = (0, 0, width, height)
                 print("Could not detect scrollable region, using full window")
+            else:
+                scroll_left, scroll_top, scroll_width, scroll_height = self.scroll_region
+                print(f"Using detected scrollable region: {scroll_width}x{scroll_height} at ({scroll_left},{scroll_top})")
 
-            # Add first capture (crop to scroll region)
+            # STEP 5: Scroll back to top to start capture from beginning
+            self.update_progress("Scrolling to top...")
+            pyautogui.hotkey('ctrl', 'home')  # Scroll to top
+            time.sleep(0.5)
+
+            # Get scroll region coordinates
             scroll_left, scroll_top, scroll_width, scroll_height = self.scroll_region
             abs_left = left + scroll_left
             abs_top = top + scroll_top
 
-            first_cropped = first_capture.crop((scroll_left, scroll_top,
-                                                scroll_left + scroll_width,
-                                                scroll_top + scroll_height))
-            self.screenshots.append(first_cropped)
-
-            # STEP 5: Continue capturing only the scrollable region
+            # STEP 6: Start capturing from the top
             identical_count = 0
 
-            for i in range(1, self.max_iterations):
+            for i in range(self.max_iterations):
                 if self.cancelled:
                     return
 
@@ -390,8 +393,8 @@ class ScrollingCapture:
                         identical_count = 0
                         self.screenshots.append(screenshot)
 
+                # Scroll down for next iteration
                 if i < self.max_iterations - 1:
-                    # Scroll down
                     pyautogui.press('pagedown')
                     time.sleep(self.scroll_delay)
 
