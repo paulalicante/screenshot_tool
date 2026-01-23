@@ -2935,7 +2935,7 @@ class ScreenshotTool:
                     def schedule_hide():
                         nonlocal hide_timer
                         try:
-                            hide_timer = container.after(100, hide_overlay_now)
+                            hide_timer = container.after(3000, hide_overlay_now)  # 3 second timeout
                         except:
                             pass
 
@@ -2959,7 +2959,19 @@ class ScreenshotTool:
                         except:
                             overlay_window = None
 
-                    container.bind("<Enter>", show_overlay)
+                    # Show overlay on enter, hide when entering another image
+                    def on_enter(e):
+                        # Hide any other open overlays first
+                        for widget in self.gallery_frame.winfo_children():
+                            if widget != container and hasattr(widget, '_hide_overlay'):
+                                try:
+                                    widget._hide_overlay()
+                                except:
+                                    pass
+                        show_overlay(e)
+
+                    container._hide_overlay = hide_overlay_now
+                    container.bind("<Enter>", on_enter)
                     container.bind("<Leave>", lambda e: schedule_hide())
 
                 create_hover_handlers(img_container, screenshot_path)
