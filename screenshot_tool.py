@@ -267,7 +267,8 @@ class ScrollingCapture:
         frame = ttk.Frame(self.progress_window, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        self.progress_label = ttk.Label(frame, text="Preparing...", font=("", 10))
+        self.progress_label = ttk.Label(frame, text="Starting capture...\nDO NOT interact with the window!",
+                                        font=("", 9), justify=tk.CENTER)
         self.progress_label.pack(pady=(0, 10))
 
         ttk.Button(frame, text="Cancel", command=self.cancel).pack()
@@ -323,15 +324,8 @@ class ScrollingCapture:
             except:
                 pass
 
-            # Move mouse to center of window
-            center_x = left + width // 2
-            center_y = top + height // 2
-            pyautogui.moveTo(center_x, center_y)
-            time.sleep(0.1)
-
-            # Click to ensure focus
-            pyautogui.click()
-            time.sleep(0.2)
+            # Give window time to come to foreground
+            time.sleep(0.5)
 
             identical_count = 0
 
@@ -348,8 +342,8 @@ class ScrollingCapture:
                     # Check if identical to previous
                     if self.screenshots and self.is_identical(self.screenshots[-1], screenshot):
                         identical_count += 1
-                        if identical_count >= 2:
-                            # Reached bottom
+                        if identical_count >= 3:
+                            # Reached bottom (3 identical = definitely at end)
                             self.update_progress(f"Completed! Stitching {len(self.screenshots)} sections...")
                             break
                     else:
