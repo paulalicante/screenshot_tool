@@ -1104,7 +1104,6 @@ class ScreenshotTool:
         self.hotkey_full = "ctrl+shift+s"
         self.hotkey_region = "ctrl+shift+r"
         self.hotkey_window = "ctrl+shift+w"
-        self.hotkey_scrolling = "ctrl+shift+l"
         self.hotkeys_registered = False
         self._capture_in_progress = False  # Prevent multiple simultaneous captures
 
@@ -1186,10 +1185,6 @@ class ScreenshotTool:
         ttk.Button(
             sidebar, text="Window (Ctrl+Shift+W)",
             command=self.start_window_capture, width=btn_width
-        ).pack(fill=tk.X, pady=(0, 5))
-        ttk.Button(
-            sidebar, text="Scrolling (Ctrl+Shift+L)",
-            command=self.start_scrolling_capture, width=btn_width
         ).pack(fill=tk.X, pady=(0, 15))
 
         ttk.Button(
@@ -1287,13 +1282,11 @@ class ScreenshotTool:
             keyboard.add_hotkey(self.hotkey_full, self.capture_fullscreen_threadsafe)
             keyboard.add_hotkey(self.hotkey_region, self.start_region_capture_threadsafe)
             keyboard.add_hotkey(self.hotkey_window, self.start_window_capture_threadsafe)
-            keyboard.add_hotkey(self.hotkey_scrolling, self.start_scrolling_capture_threadsafe)
             self.hotkeys_registered = True
             print(f"Global hotkeys registered:")
             print(f"  {self.hotkey_region} - Region capture")
             print(f"  {self.hotkey_full} - Full screen capture")
             print(f"  {self.hotkey_window} - Window capture")
-            print(f"  {self.hotkey_scrolling} - Scrolling capture")
         except Exception as e:
             print(f"Failed to register hotkeys: {e}")
             self.status_var.set(f"Warning: Could not register global hotkeys - {e}")
@@ -1304,7 +1297,6 @@ class ScreenshotTool:
                 keyboard.remove_hotkey(self.hotkey_full)
                 keyboard.remove_hotkey(self.hotkey_region)
                 keyboard.remove_hotkey(self.hotkey_window)
-                keyboard.remove_hotkey(self.hotkey_scrolling)
             except:
                 pass
 
