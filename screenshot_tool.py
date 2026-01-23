@@ -397,30 +397,32 @@ class ScrollingCapture:
     def is_identical(self, img1, img2):
         """Check if two images are identical (for detecting scroll end)"""
         try:
-            # Compare image hashes for speed
-            from PIL import ImageStat
+            from PIL import ImageStat, ImageChops
 
-            # Get bottom 30% of img1 and top 30% of img2
-            h1 = img1.height
-            h2 = img2.height
+            # Compare full images to detect if scroll didn't move
+            # Convert to same size if needed
+            if img1.size != img2.size:
+                return False
 
-            crop1 = img1.crop((0, int(h1 * 0.7), img1.width, h1))
-            crop2 = img2.crop((0, 0, img2.width, int(h2 * 0.3)))
+            # Calculate difference between entire images
+            diff_img = ImageChops.difference(img1, img2)
+            stat = ImageStat.Stat(diff_img)
 
-            # Resize to same size for comparison
-            if crop1.size != crop2.size:
-                crop2 = crop2.resize(crop1.size)
+            # Sum of mean differences across all channels (R, G, B)
+            # If images are identical, this will be very close to 0
+            total_diff = sum(stat.mean)
 
-            # Compare pixel data
-            stat1 = ImageStat.Stat(crop1)
-            stat2 = ImageStat.Stat(crop2)
+            # More lenient threshold - accounts for minor rendering differences,
+            # timestamps, animations, etc. Typical identical scroll = < 5
+            is_same = total_diff < 10.0
 
-            # Compare mean values for each channel
-            diff = sum(abs(a - b) for a, b in zip(stat1.mean, stat2.mean))
+            # Debug output
+            if is_same:
+                print(f"Identical images detected! Diff: {total_diff:.2f}")
 
-            # If difference is very small, images are identical
-            return diff < 1.0
-        except:
+            return is_same
+        except Exception as e:
+            print(f"Error comparing images: {e}")
             return False
 
     def find_overlap(self, img1, img2):
