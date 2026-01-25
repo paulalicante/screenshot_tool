@@ -2935,7 +2935,7 @@ class ScreenshotTool:
 
                         # Keep overlay visible when mouse is over it
                         overlay_window.bind("<Enter>", lambda e: cancel_hide())
-                        overlay_window.bind("<Leave>", lambda e: hide_overlay_now())  # Immediate close
+                        overlay_window.bind("<Leave>", lambda e: schedule_hide())
 
                     def cancel_hide():
                         nonlocal hide_timer
@@ -2948,9 +2948,16 @@ class ScreenshotTool:
 
                     def schedule_hide():
                         nonlocal hide_timer
+                        # Cancel any existing timer first
                         try:
-                            # Short grace period for moving from thumbnail to menu
-                            hide_timer = container.after(50, hide_overlay_now)
+                            if hide_timer:
+                                container.after_cancel(hide_timer)
+                                hide_timer = None
+                        except:
+                            pass
+                        try:
+                            # Grace period for moving between thumbnail and menu
+                            hide_timer = container.after(100, hide_overlay_now)
                         except:
                             pass
 
