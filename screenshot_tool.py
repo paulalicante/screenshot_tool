@@ -2382,52 +2382,114 @@ class ScreenshotTool:
         return folders
 
     def refresh_folder_bar(self):
-        """Rebuild the folder buttons"""
+        """Rebuild the folder buttons with thumbnail previews"""
         # Clear existing buttons and drop targets
         for widget in self.folder_buttons_frame.winfo_children():
             widget.destroy()
         self.folder_drop_targets = {}
 
-        # Button style for folder tabs
-        btn_style = {
-            'font': ('Segoe UI', 9),
-            'cursor': 'hand2',
-            'relief': tk.FLAT,
-            'bd': 1,
-            'padx': 12,
-            'pady': 4,
-        }
+        # Store thumbnail references to prevent garbage collection
+        if not hasattr(self, 'folder_preview_images'):
+            self.folder_preview_images = []
+        self.folder_preview_images.clear()
 
         # "All" button (also a drop target for root)
-        all_btn = tk.Button(
-            self.folder_buttons_frame,
-            text="All",
-            bg='#e0e0e0' if self.current_folder is None else '#f5f5f5',
-            fg='#333',
-            activebackground='#d0d0d0',
-            command=lambda: self.select_folder(None),
-            **btn_style
-        )
-        all_btn.pack(side=tk.LEFT, padx=(0, 4))
-        self.folder_drop_targets[None] = all_btn  # None = root folder
+        all_frame = self.create_folder_button_with_preview(None, "All")
+        all_frame.pack(side=tk.LEFT, padx=(0, 8))
 
-        # Folder buttons
+        # Folder buttons with previews
         for folder in self.get_folders():
-            is_selected = self.current_folder == folder
-            btn = tk.Button(
-                self.folder_buttons_frame,
-                text=folder,
-                bg='#4a90d9' if is_selected else '#f5f5f5',
-                fg='white' if is_selected else '#333',
-                activebackground='#3a80c9' if is_selected else '#d0d0d0',
-                command=lambda f=folder: self.select_folder(f),
-                **btn_style
-            )
-            btn.pack(side=tk.LEFT, padx=(0, 4))
-            self.folder_drop_targets[folder] = btn
+            folder_frame = self.create_folder_button_with_preview(folder, folder)
+            folder_frame.pack(side=tk.LEFT, padx=(0, 8))
 
-            # Right-click context menu for folder management
-            btn.bind("<Button-3>", lambda e, f=folder: self.show_folder_menu(e, f))
+    def create_folder_button_with_preview(self, folder_name, display_name):
+        """Create a folder button with thumbnail previews"""
+        is_selected = self.current_folder == folder_name
+
+        # Container frame for button
+        container = tk.Frame(self.folder_buttons_frame, bg='#f5f5f5')
+
+        # Frame for the folder button
+        btn_frame = tk.Frame(
+            container,
+            bg='#4a90d9' if is_selected else '#f5f5f5',
+            relief=tk.RAISED if is_selected else tk.FLAT,
+            bd=1,
+            cursor='hand2'
+        )
+        btn_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        # Get preview images for this folder
+        try:
+            if folder_name:
+                search_dir = self.save_dir / folder_name
+            else:
+                search_dir = self.save_dir
+
+            # Get first 3 images
+            images = sorted(
+                search_dir.glob("*.png"),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True
+            )[:3]
+
+            # Preview thumbnails row
+            if images:
+                preview_frame = tk.Frame(btn_frame, bg='#4a90d9' if is_selected else '#f5f5f5', cursor='hand2')
+                preview_frame.pack(pady=(4, 2))
+
+                for img_path in images:
+                    try:
+                        img = Image.open(img_path)
+                        img.thumbnail((30, 30), Image.Resampling.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        self.folder_preview_images.append(photo)
+
+                        lbl = tk.Label(preview_frame, image=photo, bg='#4a90d9' if is_selected else '#f5f5f5', cursor='hand2')
+                        lbl.pack(side=tk.LEFT, padx=1)
+                    except:
+                        pass
+        except:
+            pass
+
+        # Folder name label
+        name_label = tk.Label(
+            btn_frame,
+            text=display_name,
+            font=('Segoe UI', 9),
+            bg='#4a90d9' if is_selected else '#f5f5f5',
+            fg='white' if is_selected else '#333',
+            cursor='hand2'
+        )
+        name_label.pack(pady=(2, 4), padx=8)
+
+        # Click handlers for the entire frame
+        def on_click(e):
+            self.select_folder(folder_name)
+
+        # Bind click to all widgets in the button
+        for widget in btn_frame.winfo_children():
+            widget.bind("<Button-1>", on_click)
+            if folder_name:
+                widget.bind("<Button-3>", lambda e: self.show_folder_menu(e, folder_name))
+            # Also bind to children (preview thumbnails)
+            for child in widget.winfo_children():
+                child.bind("<Button-1>", on_click)
+                if folder_name:
+                    child.bind("<Button-3>", lambda e: self.show_folder_menu(e, folder_name))
+
+        btn_frame.bind("<Button-1>", on_click)
+        name_label.bind("<Button-1>", on_click)
+
+        # Right-click context menu
+        if folder_name:
+            btn_frame.bind("<Button-3>", lambda e: self.show_folder_menu(e, folder_name))
+            name_label.bind("<Button-3>", lambda e: self.show_folder_menu(e, folder_name))
+
+        # Register as drop target
+        self.folder_drop_targets[folder_name] = btn_frame
+
+        return container
 
     def select_folder(self, folder_name):
         """Select a folder to filter gallery"""
