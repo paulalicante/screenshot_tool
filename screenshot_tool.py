@@ -1131,6 +1131,9 @@ class ScreenshotTool:
         # Track all floating windows for cleanup
         self.floating_windows = []
 
+        # Track current hover overlay
+        self.current_hover_overlay = None
+
         # Build the UI
         self.setup_ui()
 
@@ -2854,6 +2857,14 @@ class ScreenshotTool:
                     def show_overlay(e):
                         nonlocal overlay_window, hide_timer
 
+                        # Close any other open hover overlay immediately
+                        if self.current_hover_overlay and self.current_hover_overlay != overlay_window:
+                            try:
+                                self.current_hover_overlay.destroy()
+                            except:
+                                pass
+                            self.current_hover_overlay = None
+
                         # Cancel any pending hide
                         if hide_timer:
                             container.after_cancel(hide_timer)
@@ -2866,6 +2877,9 @@ class ScreenshotTool:
                         overlay_window = tk.Toplevel(self.root)
                         overlay_window.overrideredirect(True)
                         overlay_window.attributes('-topmost', True)
+
+                        # Track this as the current hover overlay
+                        self.current_hover_overlay = overlay_window
 
                         # Track this window for cleanup
                         self.floating_windows.append(overlay_window)
@@ -2935,7 +2949,7 @@ class ScreenshotTool:
                     def schedule_hide():
                         nonlocal hide_timer
                         try:
-                            hide_timer = container.after(3000, hide_overlay_now)  # 3 second timeout
+                            hide_timer = container.after(300, hide_overlay_now)  # 300ms timeout
                         except:
                             pass
 
@@ -2949,29 +2963,20 @@ class ScreenshotTool:
                             pass
                         try:
                             if overlay_window:
-                                # Remove from tracking list
+                                # Remove from tracking lists
                                 try:
                                     self.floating_windows.remove(overlay_window)
                                 except:
                                     pass
+                                if self.current_hover_overlay == overlay_window:
+                                    self.current_hover_overlay = None
                                 overlay_window.destroy()
                                 overlay_window = None
                         except:
                             overlay_window = None
 
-                    # Show overlay on enter, hide when entering another image
-                    def on_enter(e):
-                        # Hide any other open overlays first
-                        for widget in self.gallery_frame.winfo_children():
-                            if widget != container and hasattr(widget, '_hide_overlay'):
-                                try:
-                                    widget._hide_overlay()
-                                except:
-                                    pass
-                        show_overlay(e)
-
-                    container._hide_overlay = hide_overlay_now
-                    container.bind("<Enter>", on_enter)
+                    # Show overlay on enter, schedule hide on leave
+                    container.bind("<Enter>", show_overlay)
                     container.bind("<Leave>", lambda e: schedule_hide())
 
                 create_hover_handlers(img_container, screenshot_path)
