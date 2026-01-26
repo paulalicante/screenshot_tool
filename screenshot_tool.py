@@ -1668,6 +1668,9 @@ class ScreenshotTool:
         # Flash effect / notification
         self.flash_notification()
 
+        # Show toast notification
+        self.show_toast_notification(img, filename)
+
         print(f"Screenshot saved: {filepath}")
         print("Image copied to clipboard - ready to paste!")
 
@@ -2154,10 +2157,105 @@ class ScreenshotTool:
             messagebox.showerror("Paste Error", error_msg)
 
     def flash_notification(self):
-        # Brief visual flash to confirm capture
-        original_bg = self.root.cget("bg")
-        self.root.configure(bg="green")
-        self.root.after(100, lambda: self.root.configure(bg=original_bg))
+        # Brief visual flash to confirm capture (only if main window visible)
+        if self.root.state() != 'withdrawn':
+            original_bg = self.root.cget("bg")
+            self.root.configure(bg="green")
+            self.root.after(100, lambda: self.root.configure(bg=original_bg))
+
+    def show_toast_notification(self, img, filename):
+        """Show a toast notification in bottom-right corner with thumbnail preview"""
+        # Create toast window
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes('-topmost', True)
+        toast.configure(bg='#2d2d2d')
+
+        # Main frame
+        frame = tk.Frame(toast, bg='#2d2d2d', relief=tk.SOLID, bd=1)
+        frame.pack(padx=2, pady=2)
+
+        # Content frame
+        content = tk.Frame(frame, bg='#2d2d2d')
+        content.pack(padx=10, pady=10)
+
+        # Create thumbnail preview
+        try:
+            thumb_img = img.copy()
+            thumb_img.thumbnail((60, 60), Image.Resampling.LANCZOS)
+            thumb_photo = ImageTk.PhotoImage(thumb_img)
+
+            # Store reference to prevent garbage collection
+            toast.thumb_photo = thumb_photo
+
+            thumb_label = tk.Label(content, image=thumb_photo, bg='#2d2d2d')
+            thumb_label.pack(side=tk.LEFT, padx=(0, 10))
+        except:
+            pass
+
+        # Text frame
+        text_frame = tk.Frame(content, bg='#2d2d2d')
+        text_frame.pack(side=tk.LEFT)
+
+        # "Saved!" text
+        saved_label = tk.Label(
+            text_frame,
+            text="✓ Saved!",
+            font=('Segoe UI', 10, 'bold'),
+            fg='#4CAF50',
+            bg='#2d2d2d'
+        )
+        saved_label.pack(anchor='w')
+
+        # Filename
+        file_label = tk.Label(
+            text_frame,
+            text=filename,
+            font=('Segoe UI', 8),
+            fg='#ffffff',
+            bg='#2d2d2d'
+        )
+        file_label.pack(anchor='w', pady=(2, 0))
+
+        # Position in bottom-right corner
+        toast.update_idletasks()
+        screen_width = toast.winfo_screenwidth()
+        screen_height = toast.winfo_screenheight()
+        toast_width = toast.winfo_reqwidth()
+        toast_height = toast.winfo_reqheight()
+
+        x = screen_width - toast_width - 20
+        y = screen_height - toast_height - 60
+        toast.geometry(f"+{x}+{y}")
+
+        # Fade in animation (opacity)
+        try:
+            toast.attributes('-alpha', 0.0)
+            def fade_in(alpha=0.0):
+                if alpha < 1.0:
+                    alpha += 0.1
+                    toast.attributes('-alpha', alpha)
+                    toast.after(20, lambda: fade_in(alpha))
+            fade_in()
+        except:
+            toast.attributes('-alpha', 1.0)
+
+        # Auto-dismiss after 2 seconds
+        def dismiss():
+            try:
+                # Fade out
+                def fade_out(alpha=1.0):
+                    if alpha > 0.0:
+                        alpha -= 0.1
+                        toast.attributes('-alpha', alpha)
+                        toast.after(20, lambda: fade_out(alpha))
+                    else:
+                        toast.destroy()
+                fade_out()
+            except:
+                toast.destroy()
+
+        toast.after(2000, dismiss)
 
     def apply_pin_setting(self):
         """Load settings from config file"""
