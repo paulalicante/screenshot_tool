@@ -46,7 +46,7 @@ python screenshot_tool.py
 - **Rapid capture** - Take multiple screenshots in succession without interruption
 
 ### Gallery
-- **Hover menu** - Floating menu with Open, Edit, Copy, Send, Move, Delete buttons
+- **Context menu** - Right-click thumbnails for Open, Edit, Copy, Send, Move, Delete options
 - **Preview slider** - Adjust thumbnail size
 - **Countdown timer** - Optional delay before capture
 
@@ -54,4 +54,4 @@ python screenshot_tool.py
 Saves to `~/Pictures/Screenshots` with subfolders for organization
 
 ## Version
-Current: v1.19
+Current: v1.20
