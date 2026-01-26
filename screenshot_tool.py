@@ -1098,7 +1098,11 @@ class ScreenshotTool:
 
         # Push targets configuration
         self.config_file = self.save_dir / "screenshot_tool_config.json"
-        self.push_targets = self.load_push_targets()
+        self.push_targets, migrated = self.load_push_targets()
+
+        # Save config if migration occurred
+        if migrated:
+            self.root.after(100, self.save_push_targets)
 
         # Hotkey configuration
         self.hotkey_full = "ctrl+shift+s"
@@ -1713,12 +1717,12 @@ class ScreenshotTool:
                 pass
 
     def load_push_targets(self):
-        """Load push targets from config file"""
+        """Load push targets from config file. Returns (targets, migrated)"""
         import json
         default_targets = [
             {
                 "name": "VSCode Claude",
-                "title_pattern": "Code]",  # Matches both "[Claude Code]" and "Visual Studio Code]"
+                "title_pattern": "claude code|visual studio code",  # Matches both Claude Code and regular VSCode
                 "click_x": None,  # None = don't click, just paste
                 "click_y": None,
                 "enabled": True
@@ -1757,11 +1761,24 @@ class ScreenshotTool:
             if self.config_file.exists():
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
-                    return config.get('push_targets', default_targets)
+                    targets = config.get('push_targets', default_targets)
+
+                    # Migrate old VSCode pattern to new multi-pattern format
+                    needs_migration = False
+                    for target in targets:
+                        if target.get('name') == 'VSCode Claude':
+                            old_pattern = target.get('title_pattern', '')
+                            # If still using old single pattern, update to multi-pattern
+                            if old_pattern.lower() in ['visual studio code', 'code]']:
+                                target['title_pattern'] = 'claude code|visual studio code'
+                                needs_migration = True
+                                print("Migrated VSCode Claude pattern to support both Claude Code and VSCode")
+
+                    return targets, needs_migration
         except Exception as e:
             print(f"Error loading config: {e}")
 
-        return default_targets
+        return default_targets, False
 
     def save_push_targets(self):
         """Save push targets and settings to config file"""
@@ -1790,11 +1807,17 @@ class ScreenshotTool:
             hwnd = None
             target_pattern = target['title_pattern'].lower()
 
+            # Support multiple patterns separated by "|"
+            patterns = [p.strip() for p in target_pattern.split('|')]
+
             def enum_callback(h, results):
                 if win32gui.IsWindowVisible(h):
-                    title = win32gui.GetWindowText(h)
-                    if target_pattern in title.lower():
-                        results.append(h)
+                    title = win32gui.GetWindowText(h).lower()
+                    # Check if any pattern matches
+                    for pattern in patterns:
+                        if pattern in title:
+                            results.append(h)
+                            return True
                 return True
 
             results = []
