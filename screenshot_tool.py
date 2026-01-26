@@ -1718,7 +1718,7 @@ class ScreenshotTool:
         default_targets = [
             {
                 "name": "VSCode Claude",
-                "title_pattern": "Visual Studio Code",
+                "title_pattern": "Code]",  # Matches both "[Claude Code]" and "Visual Studio Code]"
                 "click_x": None,  # None = don't click, just paste
                 "click_y": None,
                 "enabled": True
