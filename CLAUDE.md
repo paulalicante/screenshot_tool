@@ -54,4 +54,4 @@ python screenshot_tool.py
 Saves to `~/Pictures/Screenshots` with subfolders for organization
 
 ## Version
-Current: v1.17
+Current: v1.19
