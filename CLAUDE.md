@@ -29,6 +29,7 @@ python screenshot_tool.py
 
 ### Organization
 - **Folder system** - Create/rename/delete folders to organize screenshots
+- **Folder previews** - Each folder shows 3 thumbnail previews of recent images
 - **Drag-and-drop** - Drag screenshots between folders
 - **Storage management** - View folder sizes and delete old screenshots
 
@@ -38,9 +39,11 @@ python screenshot_tool.py
 
 ### Workflow
 - **Silent capture mode** - Capture without showing main window
+- **Toast notifications** - Bottom-right popup shows saved confirmation with thumbnail
 - **Auto-send** - Automatically send to configured apps (VSCode Claude, etc.)
 - **Import/Paste** - Import from file or paste from clipboard
 - **Copy to clipboard** - All captures automatically copied
+- **Rapid capture** - Take multiple screenshots in succession without interruption
 
 ### Gallery
 - **Hover menu** - Floating menu with Open, Edit, Copy, Send, Move, Delete buttons
@@ -51,4 +54,4 @@ python screenshot_tool.py
 Saves to `~/Pictures/Screenshots` with subfolders for organization
 
 ## Version
-Current: v1.15
+Current: v1.17
