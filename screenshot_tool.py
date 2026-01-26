@@ -3032,145 +3032,47 @@ class ScreenshotTool:
                 thumb_label.bind("<B1-Motion>", motion_h)
                 thumb_label.bind("<ButtonRelease-1>", release_h)
 
-                # Create hover menu handlers with floating overlay
-                def create_hover_handlers(container, path):
-                    overlay_window = None
-                    hide_timer = None
+                # Right-click context menu
+                def show_context_menu(e, path):
+                    menu = tk.Menu(self.root, tearoff=0)
+                    menu.add_command(label="Open", command=lambda: self.open_image(path))
+                    menu.add_command(label="Edit", command=lambda: self.edit_screenshot(path))
+                    menu.add_command(label="Copy", command=lambda: self.copy_file_to_clipboard(path))
+                    menu.add_separator()
 
-                    def show_overlay(e):
-                        nonlocal overlay_window, hide_timer
+                    # Send submenu
+                    send_menu = tk.Menu(menu, tearoff=0)
+                    for target in self.push_targets:
+                        if target.get('enabled', True):
+                            send_menu.add_command(
+                                label=target['name'],
+                                command=lambda p=path, t=target['name']: self.send_to_target(p, t)
+                            )
+                    menu.add_cascade(label="Send to", menu=send_menu)
 
-                        # Close any other open hover overlay immediately
-                        if self.current_hover_overlay and self.current_hover_overlay != overlay_window:
-                            try:
-                                self.current_hover_overlay.destroy()
-                            except:
-                                pass
-                            self.current_hover_overlay = None
+                    # Move submenu
+                    move_menu = tk.Menu(menu, tearoff=0)
+                    folders = self.get_folders()
+                    # Add "Root" option
+                    move_menu.add_command(
+                        label="📁 Root",
+                        command=lambda p=path: self.move_to_folder(p, None)
+                    )
+                    if folders:
+                        move_menu.add_separator()
+                    for folder in folders:
+                        move_menu.add_command(
+                            label=f"📁 {folder}",
+                            command=lambda p=path, f=folder: self.move_to_folder(p, f)
+                        )
+                    menu.add_cascade(label="Move to", menu=move_menu)
 
-                        # Cancel any pending hide
-                        if hide_timer:
-                            container.after_cancel(hide_timer)
-                            hide_timer = None
+                    menu.add_separator()
+                    menu.add_command(label="Delete", command=lambda: self.delete_screenshot(path))
 
-                        if overlay_window:
-                            return
+                    menu.post(e.x_root, e.y_root)
 
-                        # Create floating toplevel window
-                        overlay_window = tk.Toplevel(self.root)
-                        overlay_window.overrideredirect(True)
-                        overlay_window.attributes('-topmost', True)
-
-                        # Track this as the current hover overlay
-                        self.current_hover_overlay = overlay_window
-
-                        # Track this window for cleanup
-                        self.floating_windows.append(overlay_window)
-
-                        # Menu buttons - simple monochrome style
-                        btn_style = {'font': ("Segoe UI", 8), 'cursor': "hand2", 'relief': tk.FLAT,
-                                     'fg': '#333', 'pady': 3, 'bd': 0, 'width': 8,
-                                     'highlightthickness': 0, 'activeforeground': '#000',
-                                     'bg': '#e8e8e8', 'activebackground': '#d0d0d0'}
-
-                        frame = tk.Frame(overlay_window, bg='white', relief=tk.SOLID, bd=1)
-                        frame.pack()
-
-                        def close_and_run(func):
-                            def wrapper():
-                                hide_overlay_now()
-                                func()
-                            return wrapper
-
-                        tk.Button(frame, text="Open", **btn_style,
-                                 command=close_and_run(lambda: self.open_image(path))).pack(pady=1, padx=2)
-                        tk.Button(frame, text="Edit", **btn_style,
-                                 command=close_and_run(lambda: self.edit_screenshot(path))).pack(pady=1, padx=2)
-                        tk.Button(frame, text="Copy", **btn_style,
-                                 command=close_and_run(lambda: self.copy_file_to_clipboard(path))).pack(pady=1, padx=2)
-
-                        def show_send_popup(e):
-                            menu = tk.Menu(self.root, tearoff=0)
-                            for target in self.push_targets:
-                                if target.get('enabled', True):
-                                    menu.add_command(label=target['name'],
-                                                   command=lambda p=path, t=target['name']: self.send_to_target(p, t))
-                            menu.post(e.x_root, e.y_root)
-                            hide_overlay_now()
-
-                        send_btn = tk.Button(frame, text="Send", **btn_style)
-                        send_btn.bind("<Button-1>", show_send_popup)
-                        send_btn.pack(pady=1, padx=2)
-
-                        move_btn = tk.Button(frame, text="Move", **btn_style)
-                        move_btn.bind("<Button-1>", lambda e: (self.show_move_menu(e, path), hide_overlay_now()))
-                        move_btn.pack(pady=1, padx=2)
-
-                        tk.Button(frame, text="Delete", **btn_style,
-                                 command=close_and_run(lambda: self.delete_screenshot(path))).pack(pady=1, padx=2)
-
-                        # Position overlay centered over the thumbnail
-                        container.update_idletasks()
-                        x = container.winfo_rootx() + container.winfo_width() // 2
-                        y = container.winfo_rooty() + container.winfo_height() // 2
-                        overlay_window.update_idletasks()
-                        overlay_window.geometry(f"+{x - overlay_window.winfo_reqwidth()//2}+{y - overlay_window.winfo_reqheight()//2}")
-
-                        # Keep overlay visible when mouse is over it
-                        overlay_window.bind("<Enter>", lambda e: cancel_hide())
-                        overlay_window.bind("<Leave>", lambda e: schedule_hide())
-
-                    def cancel_hide():
-                        nonlocal hide_timer
-                        try:
-                            if hide_timer:
-                                container.after_cancel(hide_timer)
-                                hide_timer = None
-                        except:
-                            pass
-
-                    def schedule_hide():
-                        nonlocal hide_timer
-                        # Cancel any existing timer first
-                        try:
-                            if hide_timer:
-                                container.after_cancel(hide_timer)
-                                hide_timer = None
-                        except:
-                            pass
-                        try:
-                            # Grace period for moving between thumbnail and menu
-                            hide_timer = container.after(100, hide_overlay_now)
-                        except:
-                            pass
-
-                    def hide_overlay_now():
-                        nonlocal overlay_window, hide_timer
-                        try:
-                            if hide_timer:
-                                container.after_cancel(hide_timer)
-                                hide_timer = None
-                        except:
-                            pass
-                        try:
-                            if overlay_window:
-                                # Remove from tracking lists
-                                try:
-                                    self.floating_windows.remove(overlay_window)
-                                except:
-                                    pass
-                                if self.current_hover_overlay == overlay_window:
-                                    self.current_hover_overlay = None
-                                overlay_window.destroy()
-                                overlay_window = None
-                        except:
-                            overlay_window = None
-
-                    # Show overlay on enter, schedule hide on leave
-                    container.bind("<Enter>", show_overlay)
-                    container.bind("<Leave>", lambda e: schedule_hide())
-
-                create_hover_handlers(img_container, screenshot_path)
+                thumb_label.bind("<Button-3>", lambda e: show_context_menu(e, screenshot_path))
 
             except Exception as e:
                 print(f"Error loading thumbnail {screenshot_path}: {e}")
