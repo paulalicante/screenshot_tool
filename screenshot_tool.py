@@ -1092,6 +1092,26 @@ class ScreenshotTool:
         self.root.geometry("600x550")
         self.root.minsize(400, 350)
 
+        # Load logo if available
+        self.logo_path = Path(__file__).parent / "logo.png"
+        self.logo_image = None
+        if self.logo_path.exists():
+            try:
+                # Load logo for About dialog
+                logo_img = Image.open(self.logo_path)
+                # Create a smaller version for About dialog (max 200x200)
+                logo_img.thumbnail((200, 200), Image.Resampling.LANCZOS)
+                self.logo_image = ImageTk.PhotoImage(logo_img)
+
+                # Set window icon (convert PNG to ICO format)
+                icon_img = Image.open(self.logo_path)
+                icon_img = icon_img.resize((32, 32), Image.Resampling.LANCZOS)
+                icon_path = Path(__file__).parent / "icon.ico"
+                icon_img.save(icon_path, format='ICO')
+                self.root.iconbitmap(icon_path)
+            except Exception as e:
+                print(f"Could not load logo: {e}")
+
         # Set up save directory
         self.save_dir = Path.home() / "Pictures" / "Screenshots"
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -1216,6 +1236,12 @@ class ScreenshotTool:
 
         # Spacer to push counter to bottom
         ttk.Frame(sidebar).pack(fill=tk.BOTH, expand=True)
+
+        # About button at bottom
+        ttk.Button(
+            sidebar, text="About",
+            command=self.show_about, width=btn_width
+        ).pack(fill=tk.X, pady=(0, 5))
 
         # Counter display at bottom of sidebar
         self.counter_var = tk.StringVar(value="Session: 0")
@@ -3124,6 +3150,82 @@ class ScreenshotTool:
             os.startfile(str(self.save_dir))
         except Exception as e:
             messagebox.showerror("Error", f"Could not open folder: {e}")
+
+    def show_about(self):
+        """Show the About dialog"""
+        about_win = tk.Toplevel(self.root)
+        about_win.title("About Otterly Screenshots")
+        about_win.transient(self.root)
+        about_win.resizable(False, False)
+        about_win.geometry("400x450")
+
+        # Center on parent
+        about_win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 400) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 450) // 2
+        about_win.geometry(f"+{x}+{y}")
+
+        frame = ttk.Frame(about_win, padding="30")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Logo if available
+        if self.logo_image:
+            logo_label = tk.Label(frame, image=self.logo_image)
+            logo_label.pack(pady=(0, 20))
+
+        # App name
+        title_label = ttk.Label(
+            frame,
+            text="Otterly Screenshots",
+            font=("Segoe UI", 16, "bold")
+        )
+        title_label.pack()
+
+        # Version
+        version_label = ttk.Label(
+            frame,
+            text="Version 1.20",
+            font=("Segoe UI", 10)
+        )
+        version_label.pack(pady=(5, 20))
+
+        # Description
+        desc_text = (
+            "A lightweight Windows screenshot tool\n"
+            "with annotation features.\n\n"
+            "Part of the otterly.tools family."
+        )
+        desc_label = ttk.Label(
+            frame,
+            text=desc_text,
+            justify=tk.CENTER,
+            font=("Segoe UI", 9)
+        )
+        desc_label.pack(pady=(0, 20))
+
+        # Hotkeys info
+        hotkeys_frame = ttk.LabelFrame(frame, text="Hotkeys", padding="10")
+        hotkeys_frame.pack(fill=tk.X, pady=(0, 20))
+
+        hotkeys_text = (
+            "Ctrl+Shift+R  -  Capture region\n"
+            "Ctrl+Shift+S  -  Capture full screen\n"
+            "Ctrl+Shift+W  -  Capture window"
+        )
+        hotkeys_label = ttk.Label(
+            hotkeys_frame,
+            text=hotkeys_text,
+            justify=tk.LEFT,
+            font=("Consolas", 9)
+        )
+        hotkeys_label.pack()
+
+        # Close button
+        ttk.Button(
+            frame,
+            text="Close",
+            command=about_win.destroy
+        ).pack()
 
     def show_settings(self):
         """Show the settings dialog"""

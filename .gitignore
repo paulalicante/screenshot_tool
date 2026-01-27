@@ -48,6 +48,9 @@ cmake_*.txt
 *.cmd
 !run_screenshot_tool.bat
 
+# Auto-generated icon file
+icon.ico
+
 # OS files
 .DS_Store
 Thumbs.db
