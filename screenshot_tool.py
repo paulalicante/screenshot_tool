@@ -1773,6 +1773,12 @@ class ScreenshotTool:
                                 target['title_pattern'] = 'claude code|visual studio code'
                                 needs_migration = True
                                 print("Migrated VSCode Claude pattern to support both Claude Code and VSCode")
+                            # Also clear click coordinates - VSCode Claude doesn't need them
+                            if target.get('click_x') is not None or target.get('click_y') is not None:
+                                target['click_x'] = None
+                                target['click_y'] = None
+                                needs_migration = True
+                                print("Removed click coordinates from VSCode Claude - only window activation needed")
 
                     return targets, needs_migration
         except Exception as e:
@@ -3035,9 +3041,9 @@ class ScreenshotTool:
                 # Right-click context menu
                 def show_context_menu(e, path):
                     menu = tk.Menu(self.root, tearoff=0)
-                    menu.add_command(label="Open", command=lambda: self.open_image(path))
-                    menu.add_command(label="Edit", command=lambda: self.edit_screenshot(path))
-                    menu.add_command(label="Copy", command=lambda: self.copy_file_to_clipboard(path))
+                    menu.add_command(label="Open", command=lambda p=path: self.open_image(p))
+                    menu.add_command(label="Edit", command=lambda p=path: self.edit_screenshot(p))
+                    menu.add_command(label="Copy", command=lambda p=path: self.copy_file_to_clipboard(p))
                     menu.add_separator()
 
                     # Send submenu
@@ -3068,7 +3074,7 @@ class ScreenshotTool:
                     menu.add_cascade(label="Move to", menu=move_menu)
 
                     menu.add_separator()
-                    menu.add_command(label="Delete", command=lambda: self.delete_screenshot(path))
+                    menu.add_command(label="Delete", command=lambda p=path: self.delete_screenshot(p))
 
                     menu.post(e.x_root, e.y_root)
 
