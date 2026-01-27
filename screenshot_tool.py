@@ -1222,8 +1222,24 @@ class ScreenshotTool:
         sidebar = ttk.Frame(content_frame, padding="5")
         sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
-        # Spacer to align buttons with first row of thumbnails (leaves room for logo)
-        ttk.Frame(sidebar, height=110).pack()
+        # Logo at top of sidebar
+        if self.logo_image:
+            # Create a smaller version for sidebar (max 100x100)
+            try:
+                sidebar_logo_img = Image.open(self.logo_path)
+                sidebar_logo_img.thumbnail((100, 100), Image.Resampling.LANCZOS)
+                sidebar_logo_photo = ImageTk.PhotoImage(sidebar_logo_img)
+                # Keep reference to prevent garbage collection
+                self.sidebar_logo_photo = sidebar_logo_photo
+                logo_label = tk.Label(sidebar, image=sidebar_logo_photo, bg=sidebar.cget('background'))
+                logo_label.pack(pady=(5, 10))
+            except Exception as e:
+                print(f"Could not display sidebar logo: {e}")
+                # Fallback spacer if logo fails
+                ttk.Frame(sidebar, height=110).pack()
+        else:
+            # Spacer to align buttons with first row of thumbnails
+            ttk.Frame(sidebar, height=110).pack()
 
         # Sidebar buttons - stacked vertically
         btn_width = 20
