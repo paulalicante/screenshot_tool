@@ -1093,24 +1093,50 @@ class ScreenshotTool:
         self.root.minsize(400, 350)
 
         # Load logo if available
-        self.logo_path = Path(__file__).parent / "logo.png"
+        # Try multiple path resolution methods
+        self.logo_path = None
+        for path in [Path(__file__).parent / "logo.png", Path("logo.png"), Path.cwd() / "logo.png"]:
+            if path.exists():
+                self.logo_path = path
+                print(f"Found logo at: {path}")
+                break
+
         self.logo_image = None
-        if self.logo_path.exists():
+        if self.logo_path:
             try:
                 # Load logo for About dialog
                 logo_img = Image.open(self.logo_path)
                 # Create a smaller version for About dialog (max 200x200)
                 logo_img.thumbnail((200, 200), Image.Resampling.LANCZOS)
                 self.logo_image = ImageTk.PhotoImage(logo_img)
+                print("Logo loaded successfully for About dialog")
 
                 # Set window icon (convert PNG to ICO format)
-                icon_img = Image.open(self.logo_path)
-                icon_img = icon_img.resize((32, 32), Image.Resampling.LANCZOS)
-                icon_path = Path(__file__).parent / "icon.ico"
-                icon_img.save(icon_path, format='ICO')
-                self.root.iconbitmap(icon_path)
+                try:
+                    icon_img = Image.open(self.logo_path)
+                    # Convert to RGBA if needed, then to RGB (ICO doesn't support all PNG modes)
+                    if icon_img.mode not in ('RGB', 'RGBA'):
+                        icon_img = icon_img.convert('RGBA')
+                    icon_img = icon_img.resize((32, 32), Image.Resampling.LANCZOS)
+                    # Convert to RGB for ICO format
+                    if icon_img.mode == 'RGBA':
+                        # Create white background
+                        bg = Image.new('RGB', icon_img.size, (255, 255, 255))
+                        bg.paste(icon_img, mask=icon_img.split()[3])  # Use alpha channel as mask
+                        icon_img = bg
+                    else:
+                        icon_img = icon_img.convert('RGB')
+
+                    icon_path = Path(__file__).parent / "icon.ico"
+                    icon_img.save(icon_path, format='ICO')
+                    self.root.iconbitmap(str(icon_path))
+                    print("Window icon set successfully")
+                except Exception as icon_err:
+                    print(f"Could not set window icon (non-critical): {icon_err}")
             except Exception as e:
                 print(f"Could not load logo: {e}")
+                import traceback
+                traceback.print_exc()
 
         # Set up save directory
         self.save_dir = Path.home() / "Pictures" / "Screenshots"
