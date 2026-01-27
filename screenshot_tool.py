@@ -1111,26 +1111,20 @@ class ScreenshotTool:
                 self.logo_image = ImageTk.PhotoImage(logo_img)
                 print("Logo loaded successfully for About dialog")
 
-                # Set window icon (convert PNG to ICO format)
+                # Set window/taskbar icon using iconphoto (works better with PNG)
                 try:
                     icon_img = Image.open(self.logo_path)
-                    # Convert to RGBA if needed, then to RGB (ICO doesn't support all PNG modes)
-                    if icon_img.mode not in ('RGB', 'RGBA'):
-                        icon_img = icon_img.convert('RGBA')
-                    icon_img = icon_img.resize((32, 32), Image.Resampling.LANCZOS)
-                    # Convert to RGB for ICO format
-                    if icon_img.mode == 'RGBA':
-                        # Create white background
-                        bg = Image.new('RGB', icon_img.size, (255, 255, 255))
-                        bg.paste(icon_img, mask=icon_img.split()[3])  # Use alpha channel as mask
-                        icon_img = bg
-                    else:
-                        icon_img = icon_img.convert('RGB')
-
-                    icon_path = Path(__file__).parent / "icon.ico"
-                    icon_img.save(icon_path, format='ICO')
-                    self.root.iconbitmap(str(icon_path))
-                    print("Window icon set successfully")
+                    # Create multiple sizes for better taskbar display
+                    icon_sizes = [16, 32, 48, 64]
+                    self.icon_photos = []
+                    for size in icon_sizes:
+                        sized_img = icon_img.copy()
+                        sized_img.thumbnail((size, size), Image.Resampling.LANCZOS)
+                        photo = ImageTk.PhotoImage(sized_img)
+                        self.icon_photos.append(photo)
+                    # Set all sizes - tkinter will use the appropriate one
+                    self.root.iconphoto(True, *self.icon_photos)
+                    print("Window/taskbar icon set successfully")
                 except Exception as icon_err:
                     print(f"Could not set window icon (non-critical): {icon_err}")
             except Exception as e:
