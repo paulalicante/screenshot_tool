@@ -10,7 +10,7 @@ python screenshot_tool.py
 ```
 
 ## Main File
-`screenshot_tool.py` - single-file Python application (~3300 lines)
+`screenshot_tool.py` - single-file Python application (~3500 lines)
 
 ## Key Dependencies
 - PIL/Pillow - image handling and editing
@@ -52,6 +52,45 @@ python screenshot_tool.py
 
 ## Storage
 Saves to `~/Pictures/Screenshots` with subfolders for organization
+
+## Logo
+Place `logo.png` in the app directory to display:
+- In the sidebar (top)
+- In the About dialog
+- As the window/taskbar icon
+
+## Building & Distribution
+
+### Build standalone .exe (for sharing)
+```
+python build.py
+```
+Creates `dist/OtterlyScreenshots.exe` - a single file that runs without Python installed.
+
+### Install on your system
+```
+python install.py
+```
+Creates:
+- Desktop shortcut
+- Start Menu entry
+- Auto-start with Windows (optional)
+
+### Uninstall
+```
+python uninstall.py
+```
+Removes shortcuts and startup entry (keeps app files).
+
+## Files
+| File | Purpose |
+|------|---------|
+| `screenshot_tool.py` | Main application |
+| `build.py` | Build standalone .exe |
+| `install.py` | Install shortcuts & auto-start |
+| `uninstall.py` | Remove shortcuts |
+| `logo.png` | App logo (optional) |
+| `run_screenshot_tool.bat` | Quick launcher |
 
 ## Version
 Current: v1.20
