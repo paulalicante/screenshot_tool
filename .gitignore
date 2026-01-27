@@ -48,8 +48,12 @@ cmake_*.txt
 *.cmd
 !run_screenshot_tool.bat
 
-# Auto-generated icon file
+# Auto-generated icon files
 icon.ico
+app_icon.ico
+
+# PyInstaller
+*.spec
 
 # OS files
 .DS_Store
