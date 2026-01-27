@@ -1,5 +1,5 @@
 """
-Screenshot Tool - A simple Windows screenshot utility
+Otterly Screenshots - A simple Windows screenshot utility
 Features:
 - Global hotkey (Ctrl+Shift+S) to capture full screen
 - Global hotkey (Ctrl+Shift+R) to capture a region
@@ -1088,7 +1088,7 @@ class ScreenshotEditor:
 class ScreenshotTool:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Screenshot Tool v1.05")
+        self.root.title("Otterly Screenshots v1.20")
         self.root.geometry("600x550")
         self.root.minsize(400, 350)
 
@@ -3434,7 +3434,7 @@ class ScreenshotTool:
 
     def run(self):
         """Start the application"""
-        print("Screenshot Tool started!")
+        print("Otterly Screenshots started!")
         print(f"Screenshots will be saved to: {self.save_dir}")
         print(f"Hotkeys:")
         print(f"  {self.hotkey_region} - Capture region")

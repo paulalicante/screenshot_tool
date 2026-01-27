@@ -1,4 +1,4 @@
-# Screenshot Tool
+# Otterly Screenshots
 
 ## Project Type
 **Python 3 + tkinter** - single-file Python application

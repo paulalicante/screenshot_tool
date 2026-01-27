@@ -1,4 +1,4 @@
-# Screenshot Tool
+# Otterly Screenshots
 
 A lightweight Windows screenshot tool with annotation features, built with Python and tkinter.
 
@@ -15,10 +15,12 @@ A lightweight Windows screenshot tool with annotation features, built with Pytho
   - **Text** - Add text annotations anywhere on the image
   - Adjustable brush/font size
 
-- **Gallery View** - Browse recent screenshots with hover menu:
+- **Gallery View** - Browse recent screenshots with context menu (right-click):
   - Open - View in default image viewer
   - Edit - Re-open in editor to add more annotations (saves as new file)
   - Copy - Copy image to clipboard
+  - Send - Send to configured apps
+  - Move - Move to a folder
   - Delete - Remove the screenshot
 
 - **Auto-paste to VSCode Claude** - Optional feature to automatically paste screenshots
@@ -70,8 +72,9 @@ A lightweight Windows screenshot tool with annotation features, built with Pytho
 
 ### Managing Screenshots
 
-- Hover over any thumbnail to see the action menu
+- Right-click any thumbnail to see the context menu
 - Screenshots are saved to `~/Pictures/Screenshots/`
+- Organize with folders and drag-and-drop
 - Edited images save as new files (originals preserved)
 
 ## Screenshots Location
