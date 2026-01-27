@@ -3078,7 +3078,7 @@ class ScreenshotTool:
 
                     menu.post(e.x_root, e.y_root)
 
-                thumb_label.bind("<Button-3>", lambda e: show_context_menu(e, screenshot_path))
+                thumb_label.bind("<Button-3>", lambda e, path=screenshot_path: show_context_menu(e, path))
 
             except Exception as e:
                 print(f"Error loading thumbnail {screenshot_path}: {e}")
