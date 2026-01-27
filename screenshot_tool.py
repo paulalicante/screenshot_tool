@@ -1231,13 +1231,18 @@ class ScreenshotTool:
                 sidebar_logo_photo = ImageTk.PhotoImage(sidebar_logo_img)
                 # Keep reference to prevent garbage collection
                 self.sidebar_logo_photo = sidebar_logo_photo
-                logo_label = tk.Label(sidebar, image=sidebar_logo_photo, bg=sidebar.cget('background'))
+                # Use default system background color
+                logo_label = tk.Label(sidebar, image=sidebar_logo_photo)
                 logo_label.pack(pady=(5, 10))
+                print("Sidebar logo displayed successfully")
             except Exception as e:
                 print(f"Could not display sidebar logo: {e}")
+                import traceback
+                traceback.print_exc()
                 # Fallback spacer if logo fails
                 ttk.Frame(sidebar, height=110).pack()
         else:
+            print("No logo image available for sidebar (logo_image is None)")
             # Spacer to align buttons with first row of thumbnails
             ttk.Frame(sidebar, height=110).pack()
 
