@@ -15,6 +15,10 @@ import json
 import shutil
 import logging
 import traceback
+import sqlite3
+import subprocess
+import threading
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -22,53 +26,116 @@ from io import BytesIO
 import ctypes
 import struct
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QFrame, QSplitter, QScrollArea,
-    QSlider, QComboBox, QCheckBox, QDialog, QLineEdit,
-    QMessageBox, QFileDialog, QMenu, QGridLayout, QSizePolicy,
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QInputDialog, QToolBar, QSpinBox, QListWidget, QListWidgetItem,
-    QToolButton
-)
-from PyQt6.QtCore import (
-    Qt, QPoint, QTimer, QSize, QRect, QThread, pyqtSignal,
-    QMimeData, QUrl, QPropertyAnimation, QEasingCurve
-)
-from PyQt6.QtGui import (
-    QFont, QMouseEvent, QPixmap, QImage, QPainter, QPen, QBrush,
-    QColor, QCursor, QDrag, QIcon, QPainterPath, QFontMetrics,
-    QWheelEvent, QKeyEvent
-)
+
+def _show_startup_error(message: str) -> None:
+    """Show a native Windows error dialog before startup exits."""
+    print(message)
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, "Otterly Screenshots Startup Error", 0x10)
+    except Exception:
+        pass
+
+def _install_python_package(package_name: str) -> bool:
+    """Install a required package with explicit success/failure handling."""
+    print(f"Installing {package_name}...")
+    try:
+        install_result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", package_name, "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        _show_startup_error(
+            f"Timed out while installing required dependency '{package_name}'.\n"
+            f"Python: {sys.executable}"
+        )
+        return False
+
+    if install_result.returncode != 0:
+        stderr_line = (install_result.stderr or "").strip().splitlines()
+        detail = stderr_line[-1] if stderr_line else "Unknown pip error"
+        _show_startup_error(
+            f"Failed to install required dependency '{package_name}'.\n"
+            f"Python: {sys.executable}\n"
+            f"pip exit code: {install_result.returncode}\n"
+            f"Details: {detail}"
+        )
+        return False
+
+    return True
+
+
+try:
+    from PyQt6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QLabel, QPushButton, QFrame, QSplitter, QScrollArea,
+        QSlider, QComboBox, QCheckBox, QDialog, QLineEdit,
+        QMessageBox, QFileDialog, QMenu, QGridLayout, QSizePolicy,
+        QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+        QInputDialog, QToolBar, QSpinBox, QListWidget, QListWidgetItem,
+        QToolButton, QDialogButtonBox, QWidgetAction, QSizeGrip
+    )
+    from PyQt6.QtCore import (
+        Qt, QPoint, QTimer, QSize, QRect, QThread, pyqtSignal,
+        QMimeData, QUrl, QPropertyAnimation, QEasingCurve
+    )
+    from PyQt6.QtGui import (
+        QFont, QMouseEvent, QPixmap, QImage, QPainter, QPen, QBrush,
+        QColor, QCursor, QDrag, QIcon, QPainterPath, QFontMetrics,
+        QWheelEvent, QKeyEvent, QPolygon
+    )
+except ImportError:
+    if not _install_python_package("PyQt6"):
+        raise SystemExit(1)
+    try:
+        from PyQt6.QtWidgets import (
+            QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+            QLabel, QPushButton, QFrame, QSplitter, QScrollArea,
+            QSlider, QComboBox, QCheckBox, QDialog, QLineEdit,
+            QMessageBox, QFileDialog, QMenu, QGridLayout, QSizePolicy,
+            QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+            QInputDialog, QToolBar, QSpinBox, QListWidget, QListWidgetItem,
+            QToolButton, QDialogButtonBox, QWidgetAction, QSizeGrip
+        )
+        from PyQt6.QtCore import (
+            Qt, QPoint, QTimer, QSize, QRect, QThread, pyqtSignal,
+            QMimeData, QUrl, QPropertyAnimation, QEasingCurve
+        )
+        from PyQt6.QtGui import (
+            QFont, QMouseEvent, QPixmap, QImage, QPainter, QPen, QBrush,
+            QColor, QCursor, QDrag, QIcon, QPainterPath, QFontMetrics,
+            QWheelEvent, QKeyEvent, QPolygon
+        )
+    except ImportError as import_error:
+        _show_startup_error(
+            "PyQt6 import still failed after installation attempt.\n"
+            f"Python: {sys.executable}\n"
+            f"Details: {import_error}"
+        )
+        raise SystemExit(1)
 
 # External dependencies
 try:
     from PIL import Image, ImageGrab
 except ImportError:
-    print("Installing Pillow...")
-    os.system(f"{sys.executable} -m pip install Pillow --quiet")
+    if not _install_python_package("Pillow"):
+        raise SystemExit(1)
     from PIL import Image, ImageGrab
 
 try:
     import keyboard
 except ImportError:
-    print("Installing keyboard...")
-    os.system(f"{sys.executable} -m pip install keyboard --quiet")
+    if not _install_python_package("keyboard"):
+        raise SystemExit(1)
     import keyboard
 
 try:
     import mss
 except ImportError:
-    print("Installing mss...")
-    os.system(f"{sys.executable} -m pip install mss --quiet")
+    if not _install_python_package("mss"):
+        raise SystemExit(1)
     import mss
-
-try:
-    import pyautogui
-except ImportError:
-    print("Installing pyautogui...")
-    os.system(f"{sys.executable} -m pip install pyautogui --quiet")
-    import pyautogui
 
 # Win32 imports for window management and clipboard
 try:
@@ -77,8 +144,8 @@ try:
     import win32clipboard
     import win32ui
 except ImportError:
-    print("Installing pywin32...")
-    os.system(f"{sys.executable} -m pip install pywin32 --quiet")
+    if not _install_python_package("pywin32"):
+        raise SystemExit(1)
     import win32gui
     import win32con
     import win32clipboard
@@ -97,6 +164,33 @@ except ImportError:
 
 APP_NAME = "Otterly Screenshots"
 APP_VERSION = "2.0"
+
+
+def get_display_scale() -> float:
+    """Get the actual display scale factor by comparing physical (mss) to Qt logical screen size.
+    PyQt6 sets Per-Monitor DPI Aware V2, so GetSystemMetrics returns physical pixels (same as mss).
+    Qt's screen.geometry() returns logical pixels, giving us the true scale factor."""
+    try:
+        with mss.mss() as sct:
+            physical_w = sct.monitors[1]['width']  # Physical pixels from mss
+        app = QApplication.instance()
+        if app:
+            screen = app.primaryScreen()
+            if screen:
+                logical_w = screen.geometry().width()  # Qt logical pixels
+                if logical_w > 0:
+                    scale = physical_w / logical_w
+                    if scale >= 1.0:
+                        return scale
+    except Exception:
+        pass
+    # Fallback: try Windows DPI API
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
 
 # Theme Presets
 THEMES = {
@@ -310,6 +404,27 @@ Theme = Theme()
 # Paths
 SAVE_DIR = Path.home() / "Pictures" / "Screenshots"
 CONFIG_FILE = SAVE_DIR / "screenshot_tool_config.json"
+OCR_DB_PATH = SAVE_DIR / "ocr_index.db"
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+STARTUP_TRACE_PATH = SAVE_DIR / "startup_trace.log"
+
+
+def _trace_startup(message: str) -> None:
+    """Append startup diagnostics to a plain text trace file."""
+    try:
+        SAVE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STARTUP_TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} | {message}\n")
+    except Exception:
+        pass
+
+# OCR setup
+try:
+    import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    OCR_AVAILABLE = Path(TESSERACT_CMD).exists()
+except ImportError:
+    OCR_AVAILABLE = False
 
 # Set up logging
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -318,6 +433,136 @@ logging.basicConfig(
     level=logging.ERROR,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+
+# ============================================================================
+# OCR INDEX
+# ============================================================================
+
+class OcrIndex:
+    """SQLite-backed full-text index for screenshot OCR content."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _connect(self):
+        return sqlite3.connect(str(self.db_path), timeout=10)
+
+    def _init_db(self):
+        with self._connect() as con:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS ocr (
+                    filepath TEXT PRIMARY KEY,
+                    text     TEXT NOT NULL,
+                    indexed_at TEXT NOT NULL
+                )
+            """)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_filepath ON ocr(filepath)")
+
+    def index_file(self, filepath: Path, text: str):
+        with self._connect() as con:
+            con.execute("""
+                INSERT INTO ocr (filepath, text, indexed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(filepath) DO UPDATE SET text=excluded.text, indexed_at=excluded.indexed_at
+            """, (str(filepath), text, datetime.now().isoformat()))
+
+    def is_indexed(self, filepath: Path) -> bool:
+        with self._connect() as con:
+            row = con.execute("SELECT 1 FROM ocr WHERE filepath=?", (str(filepath),)).fetchone()
+            return row is not None
+
+    def get_indexed_filepaths(self, filepaths: List[Path]) -> set:
+        """Return a set of filepaths (as strings) that already exist in the OCR index."""
+        if not filepaths:
+            return set()
+
+        path_strings = [str(p) for p in filepaths]
+        indexed = set()
+
+        # SQLite has a practical parameter limit, so query in chunks.
+        chunk_size = 500
+        with self._connect() as con:
+            for i in range(0, len(path_strings), chunk_size):
+                chunk = path_strings[i:i + chunk_size]
+                placeholders = ",".join(["?"] * len(chunk))
+                sql = f"SELECT filepath FROM ocr WHERE filepath IN ({placeholders})"
+                rows = con.execute(sql, chunk).fetchall()
+                indexed.update(r[0] for r in rows)
+
+        return indexed
+
+    def search(self, query: str) -> List[Path]:
+        """Return list of Paths whose OCR text contains all query words."""
+        words = [w.strip().lower() for w in query.split() if w.strip()]
+        if not words:
+            return []
+        with self._connect() as con:
+            sql = "SELECT filepath FROM ocr WHERE " + " AND ".join(
+                ["lower(text) LIKE ?"] * len(words))
+            params = [f"%{w}%" for w in words]
+            rows = con.execute(sql, params).fetchall()
+        return [Path(r[0]) for r in rows]
+
+    def remove_file(self, filepath: Path):
+        with self._connect() as con:
+            con.execute("DELETE FROM ocr WHERE filepath=?", (str(filepath),))
+
+    def count(self) -> int:
+        with self._connect() as con:
+            return con.execute("SELECT COUNT(*) FROM ocr").fetchone()[0]
+
+
+class OcrWorker(QThread):
+    """Background thread: runs Tesseract on one image and stores result in OcrIndex."""
+    finished = pyqtSignal(str, str)   # filepath, extracted_text
+
+    def __init__(self, filepath: Path, index: OcrIndex):
+        super().__init__()
+        self.filepath = filepath
+        self.index = index
+
+    def run(self):
+        if not OCR_AVAILABLE:
+            return
+        try:
+            img = Image.open(str(self.filepath))
+            text = pytesseract.image_to_string(img, lang='eng')
+            self.index.index_file(self.filepath, text)
+            self.finished.emit(str(self.filepath), text)
+        except Exception as e:
+            logging.error(f"OCR failed for {self.filepath}: {e}")
+
+
+class ReindexWorker(QThread):
+    """Background thread: OCR all unindexed images in a directory tree."""
+    progress = pyqtSignal(int, int)   # done, total
+    finished = pyqtSignal(int)        # total indexed
+
+    def __init__(self, save_dir: Path, index: OcrIndex):
+        super().__init__()
+        self.save_dir = save_dir
+        self.index = index
+
+    def run(self):
+        if not OCR_AVAILABLE:
+            self.finished.emit(0)
+            return
+        images = list(self.save_dir.rglob("*.png"))
+        total = len(images)
+        done = 0
+        for img_path in images:
+            if not self.index.is_indexed(img_path):
+                try:
+                    img = Image.open(str(img_path))
+                    text = pytesseract.image_to_string(img, lang='eng')
+                    self.index.index_file(img_path, text)
+                except Exception as e:
+                    logging.error(f"Reindex OCR failed for {img_path}: {e}")
+            done += 1
+            self.progress.emit(done, total)
+        self.finished.emit(done)
 
 
 # ============================================================================
@@ -397,20 +642,33 @@ QMainWindow {{
 
 /* Scrollbars */
 QScrollBar:vertical {{
-    background: {t['BG_GALLERY']};
-    width: 12px;
+    background: {t['BG_DARK']};
+    width: 14px;
     margin: 0;
+    border-radius: 7px;
+    border: 1px solid {t['BORDER']};
 }}
 
 QScrollBar::handle:vertical {{
-    background: {t['TEXT_MUTED']};
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 {t['BUTTON_HOVER']},
+        stop:0.45 {t['TEXT_MUTED']},
+        stop:1 {t['BORDER']}
+    );
     min-height: 30px;
     border-radius: 6px;
     margin: 2px;
+    border: 1px solid {t['BG_DARK']};
 }}
 
 QScrollBar::handle:vertical:hover {{
-    background: {t['BUTTON_HOVER']};
+    background: qlineargradient(
+        x1:0, y1:0, x2:1, y2:0,
+        stop:0 {t['ACCENT']},
+        stop:0.5 {t['BUTTON_HOVER']},
+        stop:1 {t['TEXT_MUTED']}
+    );
 }}
 
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
@@ -418,20 +676,41 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
 }}
 
 QScrollBar:horizontal {{
-    background: {t['BG_GALLERY']};
-    height: 12px;
+    background: {t['BG_DARK']};
+    height: 14px;
     margin: 0;
+    border-radius: 7px;
+    border: 1px solid {t['BORDER']};
 }}
 
 QScrollBar::handle:horizontal {{
-    background: {t['TEXT_MUTED']};
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 {t['BUTTON_HOVER']},
+        stop:0.45 {t['TEXT_MUTED']},
+        stop:1 {t['BORDER']}
+    );
     min-width: 30px;
     border-radius: 6px;
     margin: 2px;
+    border: 1px solid {t['BG_DARK']};
 }}
 
 QScrollBar::handle:horizontal:hover {{
-    background: {t['BUTTON_HOVER']};
+    background: qlineargradient(
+        x1:0, y1:0, x2:0, y2:1,
+        stop:0 {t['ACCENT']},
+        stop:0.5 {t['BUTTON_HOVER']},
+        stop:1 {t['TEXT_MUTED']}
+    );
+}}
+
+QSplitter::handle {{
+    background: {t['BORDER']};
+}}
+
+QSplitter::handle:hover {{
+    background: {t['ACCENT']};
 }}
 
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
@@ -541,12 +820,367 @@ QListWidget::item:hover {{
 # CUSTOM TITLE BAR
 # ============================================================================
 
+# ============================================================================
+# FLOATING CAPTURE BAR
+# ============================================================================
+
+class FloatingBar(QWidget):
+    """
+    Slim always-on-top widget pinned to all virtual desktops.
+    Shows Region / Window / Screen capture buttons.
+    Delegates captures to MainWindow so all save/send/OCR logic is shared.
+    """
+
+    def __init__(self, main_window):
+        super().__init__(None,
+            Qt.WindowType.Tool |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint)
+        self.main_window = main_window
+        self._drag_pos = None
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowOpacity(0.92)
+
+        self._build_ui()
+        self._restore_position()
+
+        # Pin to all desktops after the widget has a real HWND
+        QTimer.singleShot(300, self._pin_to_all_desktops)
+
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Card frame
+        card = QFrame()
+        card.setObjectName("floatingCard")
+        card.setStyleSheet("""
+            #floatingCard {
+                background: #002B36;
+                border: 1px solid #2AA198;
+                border-radius: 10px;
+            }
+        """)
+        outer.addWidget(card)
+
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
+
+        # Drag grip
+        grip = QLabel("⠿")
+        grip.setStyleSheet("color: #586E75; font-size: 14px; padding: 0 2px;")
+        grip.setCursor(Qt.CursorShape.SizeAllCursor)
+        layout.addWidget(grip)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet("color: #2AA198; margin: 4px 2px;")
+        layout.addWidget(sep)
+
+        btn_style = """
+            QPushButton {
+                background: transparent;
+                color: #93A1A1;
+                border: none;
+                border-radius: 5px;
+                font-size: 11px;
+                padding: 4px 8px;
+                min-width: 30px;
+            }
+            QPushButton:hover {
+                background: #073642;
+                color: #2AA198;
+            }
+            QPushButton:pressed {
+                background: #2AA198;
+                color: white;
+            }
+        """
+
+        region_btn = QPushButton("⬚\nRegion")
+        region_btn.setStyleSheet(btn_style)
+        region_btn.setToolTip("Capture Region  (Ctrl+Shift+R)")
+        region_btn.clicked.connect(self._capture_region)
+        layout.addWidget(region_btn)
+
+        window_btn = QPushButton("🗗\nWindow")
+        window_btn.setStyleSheet(btn_style)
+        window_btn.setToolTip("Capture Window  (Ctrl+Shift+W)")
+        window_btn.clicked.connect(self._capture_window)
+        layout.addWidget(window_btn)
+
+        screen_btn = QPushButton("🖥\nScreen")
+        screen_btn.setStyleSheet(btn_style)
+        screen_btn.setToolTip("Capture Full Screen  (Ctrl+Shift+S)")
+        screen_btn.clicked.connect(self._capture_screen)
+        layout.addWidget(screen_btn)
+
+        # Separator
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setStyleSheet("color: #2AA198; margin: 4px 2px;")
+        layout.addWidget(sep2)
+
+        # Show main window button
+        show_btn = QPushButton("◎")
+        show_btn.setToolTip("Open Otterly Screenshots")
+        show_btn.setStyleSheet(btn_style + """
+            QPushButton { font-size: 14px; min-width: 20px; padding: 4px 4px; }
+        """)
+        show_btn.clicked.connect(self._show_main)
+        layout.addWidget(show_btn)
+
+        self.setFixedHeight(52)
+
+    # ------------------------------------------------------------------
+    def _capture_region(self):
+        self.main_window._inject_desktop_target()
+        QTimer.singleShot(100, self.main_window._start_region_capture)
+
+    def _capture_window(self):
+        self.main_window._inject_desktop_target()
+        QTimer.singleShot(100, self.main_window._start_window_capture)
+
+    def _capture_screen(self):
+        self.main_window._inject_desktop_target()
+        QTimer.singleShot(100, self.main_window._capture_fullscreen)
+
+    def _show_main(self):
+        self.main_window.show()
+        self.main_window.raise_()
+        self.main_window.activateWindow()
+        # Re-register hotkeys if they were cleared on hide
+        try:
+            self.main_window._register_hotkeys_nonblocking()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    def _pin_to_all_desktops(self):
+        if not PYVDA_AVAILABLE:
+            return
+        try:
+            AppView(int(self.winId())).pin()
+        except Exception as e:
+            logging.error(f"FloatingBar pin failed: {e}")
+
+    # ------------------------------------------------------------------
+    def _restore_position(self):
+        cfg = self.main_window.config
+        pos = cfg.get('floating_bar_pos')
+        screen = QApplication.primaryScreen().geometry()
+        self.adjustSize()
+
+        if pos:
+            x, y = pos[0], pos[1]
+            # If saved position is off-screen (monitor/layout changed), recover to visible area.
+            if (
+                x < screen.left() or y < screen.top() or
+                x > screen.right() - self.width() or
+                y > screen.bottom() - self.height()
+            ):
+                x = screen.center().x() - self.width() // 2
+                y = 20
+            self.move(x, y)
+        else:
+            # Default: top-centre of primary screen
+            self.move(screen.center().x() - self.width() // 2, 20)
+
+    def _save_position(self):
+        self.main_window.config['floating_bar_pos'] = [self.x(), self.y()]
+        self.main_window._save_config()
+
+    # ------------------------------------------------------------------
+    # Drag to move
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = None
+            self._save_position()
+
+    def closeEvent(self, event):
+        self._save_position()
+        event.accept()
+
+
+# ============================================================================
+# SEARCH PREVIEW DIALOG
+# ============================================================================
+
+class SearchPreviewDialog(QDialog):
+    """Shows a screenshot with OCR search terms highlighted."""
+
+    def __init__(self, filepath: Path, query: str, parent=None):
+        super().__init__(parent)
+        self.filepath = filepath
+        self.query = query.strip().lower()
+        self.setWindowTitle(f"Preview — {filepath.name}")
+        self.setMinimumSize(800, 600)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Toolbar
+        toolbar = QFrame()
+        toolbar.setStyleSheet(f"background: {Theme.BG_DARKER}; padding: 4px 8px;")
+        tb_layout = QHBoxLayout(toolbar)
+        tb_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.info_label = QLabel("Loading highlights…")
+        self.info_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 11px;")
+        tb_layout.addWidget(self.info_label)
+        tb_layout.addStretch()
+
+        open_btn = QPushButton("Open in viewer")
+        open_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {Theme.BG_DARK}; color: white;
+                border: none; border-radius: 4px; padding: 3px 10px; font-size: 11px;
+            }}
+            QPushButton:hover {{ background: {Theme.ACCENT}; }}
+        """)
+        open_btn.clicked.connect(lambda: os.startfile(str(filepath)))
+        tb_layout.addWidget(open_btn)
+
+        close_btn = QPushButton("✕ Close")
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #c0392b; color: white;
+                border: none; border-radius: 4px; padding: 3px 10px; font-size: 11px;
+            }}
+            QPushButton:hover {{ background: #a93226; }}
+        """)
+        close_btn.clicked.connect(self.close)
+        tb_layout.addWidget(close_btn)
+
+        layout.addWidget(toolbar)
+
+        # Scroll area with the image label
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(False)   # fixed size = native pixels, easy to scroll
+        self._scroll.setStyleSheet("background: #111;")
+        self._scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.image_label.setStyleSheet("background: #111;")
+        self._scroll.setWidget(self.image_label)
+        layout.addWidget(self._scroll)
+
+        # Load image and run OCR highlight in background
+        self._pixmap = QPixmap(str(filepath))
+        if self._pixmap.isNull():
+            self.info_label.setText("Could not load image.")
+            return
+
+        self.image_label.setPixmap(self._pixmap)
+        self.image_label.setFixedSize(self._pixmap.size())
+
+        # Show plain image immediately, then run OCR highlights
+        QTimer.singleShot(50, self._build_highlights)
+
+    def _build_highlights(self):
+        """Run OCR word-box detection and paint highlights onto a copy of the pixmap."""
+        if not OCR_AVAILABLE or not self.query:
+            self.info_label.setText("No search query.")
+            return
+
+        words = [w for w in self.query.split() if w]
+
+        try:
+            img = Image.open(str(self.filepath))
+            data = pytesseract.image_to_data(
+                img, lang='eng', output_type=pytesseract.Output.DICT)
+        except Exception as e:
+            self.info_label.setText(f"OCR error: {e}")
+            return
+
+        # Find matching boxes
+        matches = []
+        n = len(data['text'])
+        for i in range(n):
+            word = data['text'][i].strip().lower()
+            if not word:
+                continue
+            conf = int(data['conf'][i]) if str(data['conf'][i]).lstrip('-').isdigit() else 0
+            if conf < 30:
+                continue
+            for q in words:
+                if q in word:
+                    matches.append({
+                        'x': data['left'][i],
+                        'y': data['top'][i],
+                        'w': data['width'][i],
+                        'h': data['height'][i],
+                        'word': data['text'][i],
+                    })
+                    break
+
+        if not matches:
+            self.info_label.setText(f'No matches found for "{self.query}"')
+            self.image_label.setPixmap(self._pixmap)
+            return
+
+        first = matches[0]
+
+        # Paint highlights onto a copy
+        result = self._pixmap.copy()
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        highlight_color = QColor(255, 220, 0, 140)   # yellow, semi-transparent
+        border_color = QColor(255, 160, 0, 200)
+
+        for m in matches:
+            painter.setBrush(QBrush(highlight_color))
+            painter.setPen(QPen(border_color, 1))
+            painter.drawRoundedRect(
+                m['x'] - 2, m['y'] - 2, m['w'] + 4, m['h'] + 4, 3, 3)
+
+        painter.end()
+
+        self.image_label.setPixmap(result)
+        count = len(matches)
+        self.info_label.setText(
+            f'Found {count} match{"es" if count != 1 else ""} for "{self.query}"')
+
+        # Scroll so the first match is visible and centred vertically
+        QTimer.singleShot(30, lambda: self._scroll_to(first['x'], first['y'], first['h']))
+
+    def _scroll_to(self, x: int, y: int, h: int):
+        """Scroll the view so the match at (x, y) is centred in the viewport."""
+        vbar = self._scroll.verticalScrollBar()
+        hbar = self._scroll.horizontalScrollBar()
+        viewport_h = self._scroll.viewport().height()
+        viewport_w = self._scroll.viewport().width()
+        # Centre the match vertically and horizontally
+        target_y = max(0, y + h // 2 - viewport_h // 2)
+        target_x = max(0, x - viewport_w // 2)
+        vbar.setValue(target_y)
+        hbar.setValue(target_x)
+
+
 class CustomTitleBar(QWidget):
     """Custom title bar for frameless window with drag support"""
 
-    def __init__(self, parent, title: str = APP_NAME, show_logo: bool = True):
+    def __init__(self, parent, title: str = APP_NAME, show_logo: bool = True, show_window_controls: bool = True):
         super().__init__(parent)
         self.parent_window = parent
+        self.show_window_controls = show_window_controls
         self.dragging = False
         self.drag_position = QPoint()
 
@@ -577,62 +1211,101 @@ class CustomTitleBar(QWidget):
 
         layout.addStretch()
 
-        # Window control buttons
-        btn_style = f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
+        # Search box — single QLineEdit with × action inside
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("🔍  Text Search")
+        self.search_edit.setFixedWidth(220)
+        self.search_edit.setFixedHeight(24)
+        self.search_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {Theme.BG_DARKER};
                 color: {Theme.TEXT_TITLEBAR};
-                font-size: 16px;
-                font-weight: bold;
-                min-width: 40px;
-                max-width: 40px;
-                min-height: 35px;
-                max-height: 35px;
+                border: 1px solid {Theme.TEXT_MUTED};
+                border-radius: 4px;
+                padding: 1px 24px 1px 8px;
+                font-size: 11px;
             }}
-            QPushButton:hover {{
-                background: {Theme.BUTTON_BG};
-                color: {Theme.TEXT_LIGHT};
+            QLineEdit:focus {{
+                border-color: #2AA198;
             }}
-        """
+        """)
 
-        close_style = f"""
-            QPushButton {{
-                background: transparent;
-                border: none;
-                color: {Theme.TEXT_TITLEBAR};
-                font-size: 16px;
-                font-weight: bold;
-                min-width: 40px;
-                max-width: 40px;
-                min-height: 35px;
-                max-height: 35px;
-            }}
-            QPushButton:hover {{
-                background: {Theme.ERROR};
-                color: white;
-            }}
-        """
+        # Build a small × icon to use as a trailing action
+        clear_icon_pixmap = QPixmap(16, 16)
+        clear_icon_pixmap.fill(Qt.GlobalColor.transparent)
+        _p = QPainter(clear_icon_pixmap)
+        _p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        _p.setPen(QPen(QColor(Theme.TEXT_MUTED), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        _p.drawLine(4, 4, 12, 12)
+        _p.drawLine(12, 4, 4, 12)
+        _p.end()
 
-        # Minimize button
-        self.btn_minimize = QPushButton("−")
-        self.btn_minimize.setStyleSheet(btn_style)
-        self.btn_minimize.clicked.connect(parent.showMinimized)
-        layout.addWidget(self.btn_minimize)
+        self._clear_action = self.search_edit.addAction(
+            QIcon(clear_icon_pixmap), QLineEdit.ActionPosition.TrailingPosition)
+        self._clear_action.triggered.connect(self.search_edit.clear)
 
-        # Maximize button
-        self.btn_maximize = QPushButton("□")
-        self.btn_maximize.setStyleSheet(btn_style)
-        self.btn_maximize.clicked.connect(self._toggle_maximize)
-        layout.addWidget(self.btn_maximize)
+        layout.addWidget(self.search_edit)
+        layout.addSpacing(8)
 
-        # Close button
-        self.btn_close = QPushButton("×")
-        self.btn_close.setStyleSheet(close_style)
-        self.btn_close.clicked.connect(parent.close)
-        layout.addWidget(self.btn_close)
+        if self.show_window_controls:
+            # Window control buttons (only needed in frameless mode).
+            btn_style = f"""
+                QPushButton {{
+                    background: transparent;
+                    border: none;
+                    color: {Theme.TEXT_TITLEBAR};
+                    font-size: 16px;
+                    font-weight: bold;
+                    min-width: 40px;
+                    max-width: 40px;
+                    min-height: 35px;
+                    max-height: 35px;
+                }}
+                QPushButton:hover {{
+                    background: {Theme.BUTTON_BG};
+                    color: {Theme.TEXT_LIGHT};
+                }}
+            """
+
+            close_style = f"""
+                QPushButton {{
+                    background: transparent;
+                    border: none;
+                    color: {Theme.TEXT_TITLEBAR};
+                    font-size: 16px;
+                    font-weight: bold;
+                    min-width: 40px;
+                    max-width: 40px;
+                    min-height: 35px;
+                    max-height: 35px;
+                }}
+                QPushButton:hover {{
+                    background: {Theme.ERROR};
+                    color: white;
+                }}
+            """
+
+            # Minimize button
+            self.btn_minimize = QPushButton("−")
+            self.btn_minimize.setStyleSheet(btn_style)
+            self.btn_minimize.clicked.connect(parent.showMinimized)
+            layout.addWidget(self.btn_minimize)
+
+            # Maximize button
+            self.btn_maximize = QPushButton("□")
+            self.btn_maximize.setStyleSheet(btn_style)
+            self.btn_maximize.clicked.connect(self._toggle_maximize)
+            layout.addWidget(self.btn_maximize)
+
+            # Close button
+            self.btn_close = QPushButton("×")
+            self.btn_close.setStyleSheet(close_style)
+            self.btn_close.clicked.connect(parent.close)
+            layout.addWidget(self.btn_close)
 
     def _toggle_maximize(self):
+        if not self.show_window_controls:
+            return
         if self.parent_window.isMaximized():
             self.parent_window.showNormal()
             self.btn_maximize.setText("□")
@@ -641,21 +1314,97 @@ class CustomTitleBar(QWidget):
             self.btn_maximize.setText("❐")
 
     def mousePressEvent(self, event: QMouseEvent):
+        if not self.show_window_controls:
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = True
             self.drag_position = event.globalPosition().toPoint() - self.parent_window.frameGeometry().topLeft()
             event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        if not self.show_window_controls:
+            return
         if self.dragging and event.buttons() == Qt.MouseButton.LeftButton:
             self.parent_window.move(event.globalPosition().toPoint() - self.drag_position)
             event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if not self.show_window_controls:
+            return
         self.dragging = False
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if not self.show_window_controls:
+            return
         self._toggle_maximize()
+
+
+class SimpleTitleBar(QWidget):
+    """Stable top bar used with native window frame."""
+
+    def __init__(self, parent, title: str = APP_NAME):
+        super().__init__(parent)
+        self.setObjectName("titleBar")
+        self.setFixedHeight(40)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(10)
+
+        title_label = QLabel(title)
+        title_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        title_label.setStyleSheet(f"color: {Theme.TEXT_TITLEBAR}; background: transparent;")
+        layout.addWidget(title_label)
+        layout.addStretch()
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Text Search")
+        self.search_edit.setFixedWidth(240)
+        self.search_edit.setFixedHeight(24)
+        layout.addWidget(self.search_edit)
+
+
+class HoverScrollArea(QScrollArea):
+    """Scroll area that reveals vertical scrollbar on hover and hides it when not hovered."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hovering_area = False
+        self._hovering_bar = False
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(120)
+        self._hide_timer.timeout.connect(self._apply_hidden_if_idle)
+
+        vbar = self.verticalScrollBar()
+        vbar.installEventFilter(self)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def enterEvent(self, event):
+        self._hovering_area = True
+        self._hide_timer.stop()
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovering_area = False
+        self._hide_timer.start()
+        super().leaveEvent(event)
+
+    def eventFilter(self, obj, event):
+        if obj is self.verticalScrollBar():
+            if event.type() == event.Type.Enter:
+                self._hovering_bar = True
+                self._hide_timer.stop()
+                self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            elif event.type() == event.Type.Leave:
+                self._hovering_bar = False
+                self._hide_timer.start()
+        return super().eventFilter(obj, event)
+
+    def _apply_hidden_if_idle(self):
+        if not self._hovering_area and not self._hovering_bar:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
 
 # ============================================================================
@@ -765,18 +1514,33 @@ class RegionSelector(QWidget):
     def __init__(self):
         super().__init__()
 
-        # Capture screen FIRST before showing overlay
-        self.captured_pixmap = self._capture_screen()
+        # Capture screen using mss (reliable at all DPI scales)
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]  # Primary monitor
+            screenshot = sct.grab(monitor)
+            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+            data = img.tobytes("raw", "RGB")
+            qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
+            self.full_capture = QPixmap.fromImage(qimage)
+
+        # Get screen geometry and actual display scale
+        screen = QApplication.primaryScreen()
+        screen_geom = screen.geometry()
+        self.scale_factor = get_display_scale()
+
+        # Scale capture to match logical screen size for display
+        self.display_pixmap = self.full_capture.scaled(
+            screen_geom.width(), screen_geom.height(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
 
         # Fullscreen frameless overlay
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint
         )
-
-        # Cover all monitors
-        screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(screen)
+        self.setGeometry(screen_geom)
 
         self.start_point = None
         self.current_rect = QRect()
@@ -784,23 +1548,11 @@ class RegionSelector(QWidget):
 
         self.setMouseTracking(True)
 
-    def _capture_screen(self) -> QPixmap:
-        """Capture the entire screen using mss"""
-        with mss.mss() as sct:
-            monitor = sct.monitors[0]  # All monitors
-            screenshot = sct.grab(monitor)
-            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-
-            # Convert PIL to QPixmap
-            data = img.tobytes("raw", "RGB")
-            qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
-            return QPixmap.fromImage(qimage)
-
     def paintEvent(self, event):
         painter = QPainter(self)
 
-        # Draw captured image
-        painter.drawPixmap(0, 0, self.captured_pixmap)
+        # Draw scaled display image (matches logical screen)
+        painter.drawPixmap(0, 0, self.display_pixmap)
 
         # Dark overlay
         painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
@@ -809,17 +1561,19 @@ class RegionSelector(QWidget):
         if not self.current_rect.isNull() and self.current_rect.width() > 0 and self.current_rect.height() > 0:
             # Draw the selected region without overlay (clear it)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-            painter.drawPixmap(self.current_rect, self.captured_pixmap, self.current_rect)
+            painter.drawPixmap(self.current_rect, self.display_pixmap, self.current_rect)
 
             # Selection border
             painter.setPen(QPen(QColor(Theme.ACCENT), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.current_rect)
 
-            # Dimensions text
+            # Show actual output dimensions (physical pixels)
+            actual_w = int(self.current_rect.width() * self.scale_factor)
+            actual_h = int(self.current_rect.height() * self.scale_factor)
             painter.setPen(QColor(255, 255, 255))
             painter.setFont(QFont("Segoe UI", 10))
-            text = f"{self.current_rect.width()} × {self.current_rect.height()}"
+            text = f"{actual_w} × {actual_h}"
             text_pos = self.current_rect.bottomRight() + QPoint(5, 15)
 
             # Background for text
@@ -842,8 +1596,15 @@ class RegionSelector(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if self.current_rect.width() > 10 and self.current_rect.height() > 10:
-            cropped = self.captured_pixmap.copy(self.current_rect)
-            self.region_selected.emit(self.current_rect, cropped)
+            # Scale coordinates to physical resolution for cropping
+            physical_rect = QRect(
+                int(self.current_rect.x() * self.scale_factor),
+                int(self.current_rect.y() * self.scale_factor),
+                int(self.current_rect.width() * self.scale_factor),
+                int(self.current_rect.height() * self.scale_factor)
+            )
+            cropped = self.full_capture.copy(physical_rect)
+            self.region_selected.emit(physical_rect, cropped)
         else:
             self.cancelled.emit()
         self.close()
@@ -859,7 +1620,7 @@ class RegionSelector(QWidget):
 # ============================================================================
 
 class WindowSelector(QWidget):
-    """Fullscreen overlay for clicking to select a window"""
+    """Overlay for selecting a window to capture - click-through with visual feedback"""
 
     window_selected = pyqtSignal(int)  # HWND
     cancelled = pyqtSignal()
@@ -867,17 +1628,27 @@ class WindowSelector(QWidget):
     def __init__(self):
         super().__init__()
 
-        # Fullscreen semi-transparent overlay
+        # Get Qt logical screen geometry (correct for DPI-aware processes)
+        screen = QApplication.primaryScreen()
+        screen_geom = screen.geometry()
+        self.scale_factor = get_display_scale()
+
+        # Store our own hwnd to exclude from detection
+        self.my_hwnd = None
+        self.info_hwnd = None
+        self.highlighted_hwnd = None
+        self.highlight_rect = None
+
+        # Translucent overlay
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
         )
-
-        screen = QApplication.primaryScreen().geometry()
-        self.setGeometry(screen)
-
-        self.setStyleSheet("background: rgba(0, 0, 0, 50);")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setGeometry(screen_geom)
         self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setMouseTracking(True)
 
         # Info window
         self.info_window = QLabel("Click on a window to capture it\nPress ESC to cancel")
@@ -895,26 +1666,92 @@ class WindowSelector(QWidget):
         """)
         self.info_window.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.info_window.adjustSize()
-
-        # Position info window at top center
         self.info_window.move(
-            screen.width() // 2 - self.info_window.width() // 2,
+            screen_geom.width() // 2 - self.info_window.width() // 2,
             50
         )
         self.info_window.show()
 
+        # Get our window handles after showing
+        QTimer.singleShot(10, self._store_handles)
+
+    def _store_handles(self):
+        """Store our window handles to exclude from detection"""
+        self.my_hwnd = int(self.winId())
+        self.info_hwnd = int(self.info_window.winId())
+
+    def _get_window_at_point(self, x: int, y: int) -> int:
+        """Get the window handle at point, excluding our overlays.
+        x, y are Qt logical coordinates - must convert to physical for Win32 APIs."""
+        # Convert logical coords to physical for Win32 APIs (DPI-aware process)
+        phys_x = int(x * self.scale_factor)
+        phys_y = int(y * self.scale_factor)
+        hwnd = win32gui.WindowFromPoint((phys_x, phys_y))
+
+        # If we got our own window, enumerate to find the one beneath
+        if hwnd in (self.my_hwnd, self.info_hwnd):
+            # Find window beneath us
+            def callback(h, results):
+                if h in (self.my_hwnd, self.info_hwnd):
+                    return True
+                if not win32gui.IsWindowVisible(h):
+                    return True
+                try:
+                    rect = win32gui.GetWindowRect(h)  # Physical coords
+                    if rect[0] <= phys_x <= rect[2] and rect[1] <= phys_y <= rect[3]:
+                        results.append(h)
+                except:
+                    pass
+                return True
+
+            results = []
+            win32gui.EnumWindows(callback, results)
+            if results:
+                hwnd = results[0]
+
+        return win32gui.GetAncestor(hwnd, win32con.GA_ROOT) if hwnd else 0
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        # Light overlay
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 40))
+
+        # Highlight the window under cursor
+        if self.highlight_rect:
+            painter.setPen(QPen(QColor(Theme.ACCENT), 3))
+            painter.setBrush(QColor(0, 120, 215, 50))
+            painter.drawRect(self.highlight_rect)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        pos = event.globalPosition().toPoint()
+        hwnd = self._get_window_at_point(pos.x(), pos.y())
+
+        if hwnd and hwnd != self.highlighted_hwnd:
+            self.highlighted_hwnd = hwnd
+            try:
+                rect = win32gui.GetWindowRect(hwnd)  # Physical coords from Win32
+                # Convert physical coords to Qt logical coords for display
+                s = self.scale_factor
+                self.highlight_rect = QRect(
+                    int(rect[0] / s), int(rect[1] / s),
+                    int((rect[2] - rect[0]) / s), int((rect[3] - rect[1]) / s)
+                )
+            except:
+                self.highlight_rect = None
+            self.update()
+
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
-            # Get window under cursor
             pos = event.globalPosition().toPoint()
-            hwnd = win32gui.WindowFromPoint((pos.x(), pos.y()))
-
-            # Get top-level parent
-            root_hwnd = win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
+            hwnd = self._get_window_at_point(pos.x(), pos.y())
 
             self.info_window.close()
             self.close()
-            self.window_selected.emit(root_hwnd)
+
+            if hwnd:
+                self.window_selected.emit(hwnd)
+            else:
+                self.cancelled.emit()
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Escape:
@@ -1014,7 +1851,8 @@ class ThumbnailWidget(QFrame):
     double_clicked = pyqtSignal(Path)
     context_menu_requested = pyqtSignal(Path, QPoint)
 
-    def __init__(self, filepath: Path, size: QSize):
+    def __init__(self, filepath: Path, size: QSize, ocr_indexed: bool = False,
+                 thumbnail_pixmap: Optional[QPixmap] = None):
         super().__init__()
         self.filepath = filepath
         self._drag_start_pos = None
@@ -1036,16 +1874,29 @@ class ThumbnailWidget(QFrame):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(0)
 
-        # Load and scale image
-        pixmap = QPixmap(str(filepath))
+        # Use cached thumbnail pixmap when provided, fallback to direct file load.
+        pixmap = thumbnail_pixmap if thumbnail_pixmap is not None else QPixmap(str(filepath))
         if not pixmap.isNull():
-            scaled = pixmap.scaled(size, Qt.AspectRatioMode.KeepAspectRatio,
-                                  Qt.TransformationMode.SmoothTransformation)
             self.thumb_label = QLabel()
-            self.thumb_label.setPixmap(scaled)
+            self.thumb_label.setPixmap(pixmap)
             self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.thumb_label.setStyleSheet("background: transparent;")
             layout.addWidget(self.thumb_label)
+
+        # OCR badge — top-right overlay
+        if ocr_indexed:
+            self.ocr_badge = QLabel("OCR", self)
+            self.ocr_badge.setStyleSheet("""
+                background: #2AA198;
+                color: white;
+                font-size: 8px;
+                font-weight: bold;
+                border-radius: 3px;
+                padding: 1px 3px;
+            """)
+            self.ocr_badge.setFixedSize(26, 14)
+            self.ocr_badge.move(self.width() - 30, 4)
+            self.ocr_badge.raise_()
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1074,6 +1925,59 @@ class ThumbnailWidget(QFrame):
         self.double_clicked.emit(self.filepath)
 
 
+class FolderHoverPreview(QFrame):
+    """Tooltip-like popup that shows larger previews for a folder on hover."""
+
+    def __init__(self, image_paths: List[Path], base_thumb_size: int = 48):
+        super().__init__(None, Qt.WindowType.ToolTip)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {Theme.BG_LIGHT};
+                border: 1px solid {Theme.ACCENT};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                background: transparent;
+            }}
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        zoom_width = max(96, base_thumb_size * 3)
+        zoom_height = zoom_width * 2
+        shown = 0
+        for img_path in image_paths[:3]:
+            pixmap = QPixmap(str(img_path))
+            if pixmap.isNull():
+                continue
+            lbl = QLabel()
+            lbl.setFixedSize(zoom_width, zoom_height)
+            lbl.setPixmap(self._scaled_cropped(pixmap, zoom_width, zoom_height))
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(lbl)
+            shown += 1
+
+        if shown == 0:
+            empty = QLabel("No previews")
+            empty.setStyleSheet(f"color: {Theme.TEXT_MUTED}; padding: 6px;")
+            layout.addWidget(empty)
+
+    @staticmethod
+    def _scaled_cropped(pixmap: QPixmap, target_w: int, target_h: int) -> QPixmap:
+        scaled = pixmap.scaled(
+            target_w,
+            target_h,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = max(0, (scaled.width() - target_w) // 2)
+        y = max(0, (scaled.height() - target_h) // 2)
+        return scaled.copy(x, y, target_w, target_h)
+
+
 # ============================================================================
 # FOLDER BUTTON
 # ============================================================================
@@ -1085,16 +1989,21 @@ class FolderButton(QFrame):
     context_menu_requested = pyqtSignal(object, QPoint)
     file_dropped = pyqtSignal(object, Path)  # folder, source file
 
-    def __init__(self, folder_name: Optional[str], base_dir: Path, selected: bool = False):
+    def __init__(self, folder_name: Optional[str], base_dir: Path, selected: bool = False,
+                 preview_width: int = 48):
         super().__init__()
         self.folder_name = folder_name
         self.base_dir = base_dir
         self.selected = selected
+        self.preview_thumb_width = max(18, int(preview_width))
+        self.preview_thumb_height = self.preview_thumb_width * 2
+        self._preview_images: List[Path] = []
+        self._hover_preview: Optional[FolderHoverPreview] = None
 
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumWidth(80)
-        self.setMaximumWidth(120)
+        self.setMinimumWidth(180)
+        self.setMaximumWidth(220)
 
         self._update_style()
 
@@ -1113,14 +2022,19 @@ class FolderButton(QFrame):
                 key=lambda x: x.stat().st_mtime,
                 reverse=True
             )[:3]
+            self._preview_images = images
 
             for img_path in images:
                 thumb = QLabel()
                 pixmap = QPixmap(str(img_path))
                 if not pixmap.isNull():
-                    scaled = pixmap.scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio,
-                                          Qt.TransformationMode.SmoothTransformation)
+                    scaled = self._scaled_cropped(
+                        pixmap,
+                        self.preview_thumb_width,
+                        self.preview_thumb_height,
+                    )
                     thumb.setPixmap(scaled)
+                    thumb.setFixedSize(self.preview_thumb_width, self.preview_thumb_height)
                     thumb.setStyleSheet("background: transparent;")
                     preview_layout.addWidget(thumb)
 
@@ -1132,7 +2046,8 @@ class FolderButton(QFrame):
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name_label.setStyleSheet(f"""
             color: {Theme.BUTTON_TEXT};
-            font-size: 9pt;
+            font-size: 10pt;
+            font-weight: 600;
             background: transparent;
         """)
         layout.addWidget(name_label)
@@ -1179,6 +2094,21 @@ class FolderButton(QFrame):
             """)
             event.acceptProposedAction()
 
+    def enterEvent(self, event):
+        if self._preview_images:
+            self._hover_preview = FolderHoverPreview(self._preview_images, self.preview_thumb_width)
+            self._hover_preview.adjustSize()
+            pos = self.mapToGlobal(QPoint(-self._hover_preview.width() - 10, 0))
+            self._hover_preview.move(pos)
+            self._hover_preview.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hover_preview:
+            self._hover_preview.close()
+            self._hover_preview = None
+        super().leaveEvent(event)
+
     def dragLeaveEvent(self, event):
         self._update_style()
 
@@ -1189,7 +2119,162 @@ class FolderButton(QFrame):
             source = Path(url.toLocalFile())
             if source.suffix.lower() == '.png':
                 self.file_dropped.emit(self.folder_name, source)
-        event.acceptProposedAction()
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    @staticmethod
+    def _scaled_cropped(pixmap: QPixmap, target_w: int, target_h: int) -> QPixmap:
+        scaled = pixmap.scaled(
+            target_w,
+            target_h,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = max(0, (scaled.width() - target_w) // 2)
+        y = max(0, (scaled.height() - target_h) // 2)
+        return scaled.copy(x, y, target_w, target_h)
+
+
+# ============================================================================
+# STYLED DIALOG  — replaces all QMessageBox calls app-wide
+# ============================================================================
+
+class StyledDialog(QDialog):
+    """
+    Themed replacement for QMessageBox.
+    Usage:
+        dlg = StyledDialog(parent, title, message, buttons)
+        # buttons = list of (label, role)  role: 'primary' | 'danger' | 'secondary'
+        result = dlg.exec()   # returns label of clicked button, or None
+    """
+
+    _clicked: str = None
+
+    def __init__(self, parent, title: str, message: str,
+                 sub: str = "",
+                 buttons: list = None):
+        super().__init__(parent)
+        if buttons is None:
+            buttons = [("OK", "primary")]
+
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.Dialog)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        # ── outer card ──────────────────────────────────────────────────────
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame()
+        card.setObjectName("card")
+        card.setStyleSheet("""
+            QFrame#card {
+                background: #1C2936;
+                border: 1px solid #2AA198;
+                border-radius: 12px;
+            }
+        """)
+        outer.addWidget(card)
+
+        vl = QVBoxLayout(card)
+        vl.setContentsMargins(28, 22, 28, 20)
+        vl.setSpacing(12)
+
+        # title bar row
+        title_row = QHBoxLayout()
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(
+            "color: #2AA198; font-size: 13pt; font-weight: bold; background: transparent;")
+        title_row.addWidget(title_lbl)
+        title_row.addStretch()
+        vl.addLayout(title_row)
+
+        # separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #2AA19840;")
+        vl.addWidget(sep)
+
+        # message
+        msg_lbl = QLabel(message)
+        msg_lbl.setWordWrap(True)
+        msg_lbl.setStyleSheet(
+            "color: #EEE8D5; font-size: 11pt; background: transparent;")
+        vl.addWidget(msg_lbl)
+
+        if sub:
+            sub_lbl = QLabel(sub)
+            sub_lbl.setWordWrap(True)
+            sub_lbl.setStyleSheet(
+                "color: #93A1A1; font-size: 9pt; background: transparent;")
+            vl.addWidget(sub_lbl)
+
+        vl.addSpacing(6)
+
+        # buttons row
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.setSpacing(10)
+
+        _role_styles = {
+            'primary': (
+                "QPushButton{background:#2AA198;color:#fff;border:none;"
+                "border-radius:6px;padding:8px 22px;font-size:10pt;font-weight:bold;}"
+                "QPushButton:hover{background:#33c4bb;}"
+                "QPushButton:pressed{background:#1d8a82;}"
+            ),
+            'danger': (
+                "QPushButton{background:#DC322F;color:#fff;border:none;"
+                "border-radius:6px;padding:8px 22px;font-size:10pt;font-weight:bold;}"
+                "QPushButton:hover{background:#e85552;}"
+                "QPushButton:pressed{background:#b52724;}"
+            ),
+            'secondary': (
+                "QPushButton{background:#073642;color:#93A1A1;border:1px solid #2AA19860;"
+                "border-radius:6px;padding:8px 22px;font-size:10pt;}"
+                "QPushButton:hover{background:#0d4a5c;color:#EEE8D5;}"
+                "QPushButton:pressed{background:#002B36;}"
+            ),
+        }
+
+        self._result = None
+        for label, role in buttons:
+            btn = QPushButton(label)
+            btn.setStyleSheet(_role_styles.get(role, _role_styles['secondary']))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _, l=label: self._finish(l))
+            btn_row.addWidget(btn)
+
+        vl.addLayout(btn_row)
+
+    def _finish(self, label: str):
+        self._result = label
+        self.accept()
+
+    def exec(self) -> str:   # type: ignore[override]
+        super().exec()
+        return self._result
+
+    # ── convenience class-methods mirroring QMessageBox API ─────────────────
+
+    @classmethod
+    def question(cls, parent, title: str, message: str,
+                 yes_text="Yes", no_text="No") -> bool:
+        dlg = cls(parent, title, message, buttons=[
+            (yes_text, 'danger'), (no_text, 'secondary')])
+        return dlg.exec() == yes_text
+
+    @classmethod
+    def warning(cls, parent, title: str, message: str):
+        dlg = cls(parent, title, message, buttons=[("OK", "primary")])
+        dlg.exec()
+
+    @classmethod
+    def info(cls, parent, title: str, message: str):
+        dlg = cls(parent, title, message, buttons=[("OK", "primary")])
+        dlg.exec()
 
 
 # ============================================================================
@@ -1197,16 +2282,17 @@ class FolderButton(QFrame):
 # ============================================================================
 
 class ScreenshotEditor(QMainWindow):
-    """Screenshot annotation editor with highlight, circle, and text tools"""
+    """Screenshot annotation editor — highlight, pen, arrow, circle, rect, blur, text, undo"""
 
     editing_complete = pyqtSignal(QPixmap)
     editing_cancelled = pyqtSignal()
 
     COLORS = {
-        'yellow': QColor(255, 255, 0, 100),
-        'green': QColor(0, 255, 0, 100),
-        'blue': QColor(0, 150, 255, 100),
-        'red': QColor(255, 0, 0, 100),
+        'yellow': QColor(255, 220, 0, 160),
+        'green':  QColor(0, 210, 80, 160),
+        'blue':   QColor(30, 144, 255, 200),
+        'red':    QColor(220, 40, 40, 200),
+        'white':  QColor(255, 255, 255, 230),
     }
 
     def __init__(self, pixmap: QPixmap):
@@ -1214,400 +2300,1072 @@ class ScreenshotEditor(QMainWindow):
 
         self.original_pixmap = pixmap
         self.current_color = self.COLORS['yellow']
+        self.color_name = 'yellow'
         self.brush_size = 20
-        self.draw_mode = 'highlight'  # highlight, circle, text
-        self.straight_line = False
+        # modes: highlight, pen, arrow, circle, rect, blur, text
+        self.draw_mode = 'highlight'
         self.drawing = False
+        self.start_point = None   # fixed anchor for shapes / straight line
         self.last_point = None
 
-        # Create overlay for drawings
+        # Committed annotations live here
         self.overlay_pixmap = QPixmap(pixmap.size())
         self.overlay_pixmap.fill(Qt.GlobalColor.transparent)
 
-        # Preview layer for shapes being drawn
+        # Live-preview layer (cleared on every mouse-move for shape tools)
         self.preview_pixmap = QPixmap(pixmap.size())
         self.preview_pixmap.fill(Qt.GlobalColor.transparent)
+
+        # Per-stroke highlight layer — redrawn from scratch each move,
+        # merged to overlay on mouseup.  Prevents alpha stacking mid-stroke.
+        self.stroke_pixmap = QPixmap(pixmap.size())
+        self.stroke_pixmap.fill(Qt.GlobalColor.transparent)
+        self._stroke_points: list = []   # accumulated points for current highlight stroke
+        self._straight_marker = False     # lock highlight to horizontal
+
+        # Undo stack — list of overlay QPixmap snapshots
+        self._undo_stack: list = []
 
         self._setup_ui()
 
     def _setup_ui(self):
-        # Frameless window
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        # Override the app-level QSS cascade so :hover colours work correctly
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background: #f0f0f0; color: #222222; }
+        """)
 
-        # Size to fit image with toolbar
+        self.setWindowFlags(Qt.WindowType.Window)
+        self.setWindowTitle("Otterly — Edit Screenshot")
         img_size = self.original_pixmap.size()
         screen = QApplication.primaryScreen().geometry()
-
-        # Minimum window size to ensure toolbar is always visible
-        min_window_w = 800
-        min_window_h = 200
-        toolbar_height = 80  # Space for toolbar + margins
-
-        # Maximum size (screen minus margins)
-        max_w = screen.width() - 100
-        max_h = screen.height() - 150
-
-        # Scale image if too large for screen
-        scale = min(1.0, max_w / img_size.width(), (max_h - toolbar_height) / img_size.height())
+        toolbar_h = 100
+        max_w = screen.width() - 80
+        max_h = screen.height() - 120
+        scale = min(1.0, max_w / img_size.width(), (max_h - toolbar_h) / img_size.height())
         self.display_size = QSize(int(img_size.width() * scale), int(img_size.height() * scale))
         self.scale_factor = scale
 
-        # Window size: at least minimum, or larger if image requires it
-        window_w = max(min_window_w, self.display_size.width() + 20)
-        window_h = max(min_window_h, self.display_size.height() + toolbar_height)
-
-        # Don't exceed screen size
-        window_w = min(window_w, max_w)
-        window_h = min(window_h, max_h)
-
+        window_w = min(max(900, self.display_size.width() + 20), max_w)
+        window_h = min(max(200, self.display_size.height() + toolbar_h), max_h)
         self.setFixedSize(window_w, window_h)
+        self.move((screen.width() - window_w) // 2, (screen.height() - window_h) // 2)
 
-        # Center on screen
-        self.move(
-            (screen.width() - self.width()) // 2,
-            (screen.height() - self.height()) // 2
-        )
-
-        # Main container
         container = QWidget()
-        container.setStyleSheet(f"background: {Theme.BG_CONTENT};")
+        # Editor always uses a fixed light theme — independent of app theme
+        container.setStyleSheet("background: #f0f0f0;")
         self.setCentralWidget(container)
-
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        # Toolbar
+        # ── Toolbar ──────────────────────────────────────────────────────────
         toolbar = QFrame()
-        toolbar.setStyleSheet(f"background: {Theme.BG_LIGHT}; border-radius: 6px;")
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(10, 8, 10, 8)
-        toolbar_layout.setSpacing(8)
+        toolbar.setStyleSheet("background: #e0e0e0; border-radius: 6px;")
+        tb = QHBoxLayout(toolbar)
+        tb.setContentsMargins(8, 6, 8, 6)
+        tb.setSpacing(6)
 
-        # Color buttons
-        self.color_buttons = {}
-        for name, color in self.COLORS.items():
-            btn = QPushButton()
-            btn.setFixedSize(30, 30)
-            # Use fully opaque color for button
-            opaque_color = QColor(color.red(), color.green(), color.blue())
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: {opaque_color.name()};
-                    border: 2px solid {Theme.TEXT_DARK};
-                    border-radius: 4px;
-                }}
-                QPushButton:hover {{
-                    border-width: 3px;
-                }}
-            """)
-            btn.clicked.connect(lambda checked, c=color, n=name: self._set_color(c, n))
-            toolbar_layout.addWidget(btn)
-            self.color_buttons[name] = btn
+        # Color swatches
+        # ── colour picker dropdown ────────────────────────────────────────────
+        self._color_btn = QPushButton()
+        self._color_btn.setFixedSize(44, 44)
+        self._color_btn.setToolTip("Colour  (click to pick)")
+        self._color_btn.setStyleSheet(
+            "QPushButton{border:2px solid #888;border-radius:6px;background:#ffdc00;}"
+            "QPushButton:hover{border-color:#2AA198;}")
+        self._color_btn.clicked.connect(self._show_color_menu)
+        tb.addWidget(self._color_btn)
 
-        toolbar_layout.addSpacing(15)
+        tb.addWidget(self._vsep())
 
-        # Mode buttons
-        mode_style = f"""
-            QPushButton {{
-                background: {Theme.BG_CONTENT};
-                color: {Theme.TEXT_DARK};
-                border: 1px solid {Theme.BORDER};
-                border-radius: 4px;
-                padding: 6px 12px;
-                font-size: 10pt;
-            }}
-            QPushButton:hover {{
-                background: {Theme.BORDER};
-            }}
-            QPushButton:checked {{
-                background: {Theme.ACCENT};
-                color: white;
-                border-color: {Theme.ACCENT};
-            }}
+        # ── tool icon buttons ─────────────────────────────────────────────────
+        SZ = 44   # icon button size
+        icon_style = """
+            QPushButton {
+                background: #e8e8e8; border: 1px solid #bbbbbb;
+                border-radius: 6px; padding: 0px;
+            }
+            QPushButton:hover  { background: #d0d0d0; border-color: #888888; }
+            QPushButton:checked {
+                background: #2AA198; border: 2px solid #1d8a82;
+            }
+            QPushButton:checked:hover { background: #1d8a82; }
         """
 
-        self.highlight_btn = QPushButton("Highlight")
-        self.highlight_btn.setCheckable(True)
-        self.highlight_btn.setChecked(True)
-        self.highlight_btn.setStyleSheet(mode_style)
-        self.highlight_btn.clicked.connect(lambda: self._set_mode('highlight'))
-        toolbar_layout.addWidget(self.highlight_btn)
+        def _icon_btn(icon_pixmap, tooltip, mode=None, checkable=True):
+            b = QPushButton()
+            b.setFixedSize(SZ, SZ)
+            b.setCheckable(checkable)
+            b.setIcon(QIcon(icon_pixmap))
+            b.setIconSize(QSize(SZ - 10, SZ - 10))
+            b.setToolTip(tooltip)
+            b.setStyleSheet(icon_style)
+            return b
 
-        self.circle_btn = QPushButton("Circle")
-        self.circle_btn.setCheckable(True)
-        self.circle_btn.setStyleSheet(mode_style)
-        self.circle_btn.clicked.connect(lambda: self._set_mode('circle'))
-        toolbar_layout.addWidget(self.circle_btn)
+        tools_def = [
+            ('highlight',    self._make_icon_highlight(),     '🖌 Marker  [H]'),
+            ('pen',          self._make_icon_pen(),           '✏ Pen  [P]'),
+            ('line',         self._make_icon_line(),          '╱ Straight line  [L]'),
+            ('arrow',        self._make_icon_arrow(),         '➜ Arrow  [A]'),
+            ('rect',         self._make_icon_rect(),          '▭ Rectangle  [R]'),
+            ('circle',       self._make_icon_circle(),        '◯ Circle  [C]'),
+            ('blur',         self._make_icon_blur(),          '⬛ Blur / redact  [B]'),
+            ('text',         self._make_icon_text(),          'T Text  [T]'),
+            ('measure_line', self._make_icon_measure_line(),  '📏 Measure line  [M]'),
+            ('measure_rect', self._make_icon_measure_rect(),  '📐 Measure rect  [shift+M]'),
+        ]
+        self._tool_btns = {}
+        for mode, icon_px, tip in tools_def:
+            btn = _icon_btn(icon_px, tip)
+            btn.clicked.connect(lambda chk, m=mode: self._set_mode(m))
+            tb.addWidget(btn)
+            self._tool_btns[mode] = btn
+        self._tool_btns['highlight'].setChecked(True)
 
-        self.text_btn = QPushButton("Text")
-        self.text_btn.setCheckable(True)
-        self.text_btn.setStyleSheet(mode_style)
-        self.text_btn.clicked.connect(lambda: self._set_mode('text'))
-        toolbar_layout.addWidget(self.text_btn)
+        # Aspect ratio lock for measure_rect (right-click the button for menu)
+        self._measure_aspect = 'free'   # 'free' or 'W:H' string e.g. '16:9'
+        self._aspect_ratios = [
+            ('Free',  'free'),
+            ('16:9',  '16:9'),
+            ('4:3',   '4:3'),
+            ('1:1',   '1:1'),
+            ('3:2',   '3:2'),
+            ('21:9',  '21:9'),
+            ('9:16',  '9:16'),
+            ('2:3',   '2:3'),
+        ]
+        mr_btn = self._tool_btns['measure_rect']
+        mr_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        mr_btn.customContextMenuRequested.connect(self._show_aspect_menu)
+        # Also left-click cycles through presets
+        mr_btn.clicked.connect(self._show_aspect_menu_on_click)
 
-        self.mode_buttons = [self.highlight_btn, self.circle_btn, self.text_btn]
+        # Straight-line lock (also Shift key)
+        self._straight_btn = _icon_btn(
+            self._make_icon_straight(),
+            '⇔ Straight marker  [Shift while dragging]')
+        self._straight_btn.toggled.connect(lambda v: setattr(self, '_straight_marker', v))
+        tb.addWidget(self._straight_btn)
 
-        toolbar_layout.addSpacing(15)
+        # Measure stamp toggle — when ON, measurements are committed to the image
+        self._measure_stamp = False
+        self._stamp_btn = _icon_btn(
+            self._make_icon_stamp(),
+            '📌 Stamp measurements onto image  (when off, measurements vanish on release)')
+        self._stamp_btn.toggled.connect(lambda v: setattr(self, '_measure_stamp', v))
+        tb.addWidget(self._stamp_btn)
 
-        # Brush size
-        size_label = QLabel("Size:")
-        size_label.setStyleSheet(f"color: {Theme.TEXT_DARK}; background: transparent;")
-        toolbar_layout.addWidget(size_label)
+        tb.addWidget(self._vsep())
 
+        # ── size slider (bigger) ──────────────────────────────────────────────
+        size_lbl = QLabel("Size")
+        size_lbl.setStyleSheet("color:#444; background:transparent; font-size:9pt;")
+        tb.addWidget(size_lbl)
         self.size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setRange(5, 50)
+        self.size_slider.setRange(2, 60)
         self.size_slider.setValue(20)
-        self.size_slider.setFixedWidth(100)
+        self.size_slider.setFixedWidth(120)
+        self.size_slider.setFixedHeight(22)
         self.size_slider.valueChanged.connect(self._on_size_changed)
-        toolbar_layout.addWidget(self.size_slider)
-
+        tb.addWidget(self.size_slider)
         self.size_value = QLabel("20")
-        self.size_value.setStyleSheet(f"color: {Theme.TEXT_DARK}; background: transparent;")
-        toolbar_layout.addWidget(self.size_value)
+        self.size_value.setFixedWidth(28)
+        self.size_value.setStyleSheet("color:#222; background:transparent; font-size:10pt;")
+        tb.addWidget(self.size_value)
 
-        toolbar_layout.addSpacing(15)
+        tb.addWidget(self._vsep())
 
-        # Straight line checkbox
-        self.straight_check = QCheckBox("Straight lines")
-        self.straight_check.setStyleSheet(f"color: {Theme.TEXT_DARK}; background: transparent;")
-        self.straight_check.stateChanged.connect(lambda s: setattr(self, 'straight_line', s == Qt.CheckState.Checked.value))
-        toolbar_layout.addWidget(self.straight_check)
+        # ── undo / cancel / save icon buttons ────────────────────────────────
+        undo_btn = _icon_btn(self._make_icon_undo(), '↩ Undo  [Ctrl+Z]', checkable=False)
+        undo_btn.clicked.connect(self._undo)
+        tb.addWidget(undo_btn)
 
-        toolbar_layout.addStretch()
+        tb.addStretch()
 
-        # Cancel button
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {Theme.ERROR};
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-size: 10pt;
-            }}
-            QPushButton:hover {{
-                background: #c0392b;
-            }}
-        """)
+        cancel_btn = _icon_btn(self._make_icon_cancel(), '✕ Cancel  [Esc]', checkable=False)
+        cancel_btn.setStyleSheet(
+            "QPushButton{background:#DC322F;border:none;border-radius:6px;padding:0px;}"
+            "QPushButton:hover{background:#e85552;}"
+            "QPushButton:pressed{background:#b52724;}")
         cancel_btn.clicked.connect(self._cancel)
-        toolbar_layout.addWidget(cancel_btn)
+        tb.addWidget(cancel_btn)
 
-        # Save button
-        save_btn = QPushButton("Save")
-        save_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {Theme.SUCCESS};
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-size: 10pt;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background: #27ae60;
-            }}
-        """)
+        save_btn = _icon_btn(self._make_icon_save(), '✔ Save  [Enter]', checkable=False)
+        save_btn.setStyleSheet(
+            "QPushButton{background:#2AA198;border:none;border-radius:6px;padding:0px;}"
+            "QPushButton:hover{background:#33c4bb;}"
+            "QPushButton:pressed{background:#1d8a82;}")
         save_btn.clicked.connect(self._save)
-        toolbar_layout.addWidget(save_btn)
+        tb.addWidget(save_btn)
 
         layout.addWidget(toolbar)
 
-        # Canvas
+        # ── Canvas ───────────────────────────────────────────────────────────
         self.canvas = QLabel()
         self.canvas.setFixedSize(self.display_size)
-        self.canvas.setStyleSheet(f"background: white; border: 1px solid {Theme.BORDER};")
+        self.canvas.setStyleSheet(f"background:white; border:1px solid {Theme.BORDER};")
         self.canvas.setCursor(Qt.CursorShape.CrossCursor)
         self.canvas.setMouseTracking(True)
+        self.canvas.installEventFilter(self)
         layout.addWidget(self.canvas, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Install event filter for mouse events
-        self.canvas.installEventFilter(self)
-
         self._update_canvas()
-
-        # Select yellow by default
         self._set_color(self.COLORS['yellow'], 'yellow')
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _vsep(self):
+        f = QFrame()
+        f.setFrameShape(QFrame.Shape.VLine)
+        f.setStyleSheet(f"color:{Theme.BORDER}; margin:4px 2px;")
+        return f
+
+    def _swatch_style(self, name: str, selected: bool) -> str:
+        c = self.COLORS[name]
+        opaque = QColor(c.red(), c.green(), c.blue()).name()
+        border = Theme.ACCENT if selected else Theme.TEXT_DARK
+        width = '3px' if selected else '2px'
+        return (f"QPushButton{{background:{opaque};border:{width} solid {border};"
+                f"border-radius:4px;}} QPushButton:hover{{border-width:3px;}}")
+
+    def _show_color_menu(self):
+        """Pop up a small colour-picker panel near the colour button."""
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background:#f0f0f0; border:1px solid #aaa; padding:6px; }
+            QMenu::item { padding:0px; margin:2px; background:transparent; }
+            QMenu::item:selected { background:transparent; }
+        """)
+        row = QWidgetAction(menu)
+        w = QWidget()
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(4, 4, 4, 4)
+        hl.setSpacing(6)
+        for name, color in self.COLORS.items():
+            opaque = QColor(color.red(), color.green(), color.blue())
+            btn = QPushButton()
+            btn.setFixedSize(32, 32)
+            btn.setToolTip(name.capitalize())
+            btn.setStyleSheet(
+                f"QPushButton{{background:{opaque.name()};border:2px solid #888;"
+                f"border-radius:5px;}}"
+                f"QPushButton:hover{{border-color:#2AA198;border-width:3px;}}")
+            btn.clicked.connect(lambda chk, c=color, n=name: (
+                self._set_color(c, n), menu.close()))
+            hl.addWidget(btn)
+        row.setDefaultWidget(w)
+        menu.addAction(row)
+        menu.exec(self._color_btn.mapToGlobal(
+            self._color_btn.rect().bottomLeft()))
 
     def _set_color(self, color: QColor, name: str):
         self.current_color = color
-        # Update button borders
-        for n, btn in self.color_buttons.items():
-            c = self.COLORS[n]
-            opaque = QColor(c.red(), c.green(), c.blue())
-            if n == name:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: {opaque.name()};
-                        border: 3px solid {Theme.ACCENT};
-                        border-radius: 4px;
-                    }}
-                """)
-            else:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background: {opaque.name()};
-                        border: 2px solid {Theme.TEXT_DARK};
-                        border-radius: 4px;
-                    }}
-                    QPushButton:hover {{
-                        border-width: 3px;
-                    }}
-                """)
+        self.color_name = name
+        # Update the colour swatch button
+        opaque = QColor(color.red(), color.green(), color.blue())
+        self._color_btn.setStyleSheet(
+            f"QPushButton{{background:{opaque.name()};border:2px solid #2AA198;"
+            f"border-radius:6px;}}"
+            f"QPushButton:hover{{border-color:#33c4bb;}}")
+
+    # ── icon drawing helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _blank_icon(size=34) -> tuple:
+        """Return (QPixmap, QPainter) ready to draw on. Caller must call p.end()."""
+        px = QPixmap(size, size)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        return px, p
+
+    def _make_icon_highlight(self):
+        import os
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QRectF
+        svg_path = os.path.join(os.path.dirname(__file__), 'assets', 'highlight_icon.svg')
+        if os.path.exists(svg_path):
+            px = QPixmap(32, 32)
+            px.fill(Qt.GlobalColor.transparent)
+            p2 = QPainter(px)
+            p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+            QSvgRenderer(svg_path).render(p2, QRectF(0, 0, 32, 32))
+            p2.end()
+            return px
+        # Fallback
+        px, p = self._blank_icon()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 220, 0, 160))
+        p.drawRoundedRect(2, 12, 30, 10, 4, 4)
+        p.setBrush(QColor(60, 60, 60))
+        p.drawPolygon(QPolygon([QPoint(4, 10), QPoint(10, 10),
+                                QPoint(10, 14), QPoint(4, 14)]))
+        p.end(); return px
+
+    def _make_icon_pen(self):
+        # Use our custom pen SVG asset
+        import os
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QRectF
+        svg_path = os.path.join(os.path.dirname(__file__), 'assets', 'pen_icon.svg')
+        if os.path.exists(svg_path):
+            px = QPixmap(32, 32)
+            px.fill(Qt.GlobalColor.transparent)
+            p2 = QPainter(px)
+            p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+            QSvgRenderer(svg_path).render(p2, QRectF(0, 0, 32, 32))
+            p2.end()
+            return px
+        # Fallback to drawn icon
+        px, p = self._blank_icon()
+        pen = QPen(QColor(40, 40, 40), 2.5, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPoint(6, 28), QPoint(26, 6))
+        p.setBrush(QColor(40, 40, 40))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(QPolygon([QPoint(4, 30), QPoint(8, 26), QPoint(10, 30)]))
+        p.end(); return px
+
+    def _make_icon_line(self):
+        import os
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QRectF
+        svg_path = os.path.join(os.path.dirname(__file__), 'assets', 'line_icon.svg')
+        if os.path.exists(svg_path):
+            px = QPixmap(32, 32)
+            px.fill(Qt.GlobalColor.transparent)
+            p2 = QPainter(px)
+            p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+            QSvgRenderer(svg_path).render(p2, QRectF(0, 0, 32, 32))
+            p2.end()
+            return px
+        # Fallback
+        px, p = self._blank_icon()
+        pen = QPen(QColor(40, 40, 40), 2.5, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPoint(4, 28), QPoint(30, 6))
+        p.end(); return px
+
+    def _make_icon_arrow(self):
+        import os
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QRectF
+        svg_path = os.path.join(os.path.dirname(__file__), 'assets', 'arrow_icon.svg')
+        if os.path.exists(svg_path):
+            px = QPixmap(32, 32)
+            px.fill(Qt.GlobalColor.transparent)
+            p2 = QPainter(px)
+            p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+            QSvgRenderer(svg_path).render(p2, QRectF(0, 0, 32, 32))
+            p2.end()
+            return px
+        # Fallback
+        import math
+        px, p = self._blank_icon()
+        pen = QPen(QColor(40, 40, 40), 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPoint(5, 28), QPoint(27, 6))
+        p.setBrush(QColor(40, 40, 40))
+        p.setPen(Qt.PenStyle.NoPen)
+        angle = math.atan2(6 - 28, 27 - 5)
+        hd = 9; sp = math.pi / 6
+        pts = [QPoint(27, 6),
+               QPoint(int(27 - hd * math.cos(angle - sp)), int(6 - hd * math.sin(angle - sp))),
+               QPoint(int(27 - hd * math.cos(angle + sp)), int(6 - hd * math.sin(angle + sp)))]
+        p.drawPolygon(QPolygon(pts))
+        p.end(); return px
+
+    def _make_icon_rect(self):
+        import os
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QRectF
+        svg_path = os.path.join(os.path.dirname(__file__), 'assets', 'rect_icon.svg')
+        if os.path.exists(svg_path):
+            px = QPixmap(32, 32)
+            px.fill(Qt.GlobalColor.transparent)
+            p2 = QPainter(px)
+            p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+            QSvgRenderer(svg_path).render(p2, QRectF(0, 0, 32, 32))
+            p2.end()
+            return px
+        px, p = self._blank_icon()
+        p.setPen(QPen(QColor(40, 40, 40), 2.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(4, 6, 26, 22, 2, 2)
+        p.end(); return px
+
+    def _make_icon_circle(self):
+        import os
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QRectF
+        svg_path = os.path.join(os.path.dirname(__file__), 'assets', 'circle_icon.svg')
+        if os.path.exists(svg_path):
+            px = QPixmap(32, 32)
+            px.fill(Qt.GlobalColor.transparent)
+            p2 = QPainter(px)
+            p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+            QSvgRenderer(svg_path).render(p2, QRectF(0, 0, 32, 32))
+            p2.end()
+            return px
+        px, p = self._blank_icon()
+        p.setPen(QPen(QColor(40, 40, 40), 2.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPoint(17, 17), 12, 11)
+        p.end(); return px
+
+    def _make_icon_blur(self):
+        import os
+        png_path = os.path.join(os.path.dirname(__file__), 'assets', 'blur_tool_32.png')
+        if os.path.exists(png_path):
+            return QPixmap(png_path)
+        # Fallback
+        px, p = self._blank_icon()
+        cols = [(80,80,80),(160,160,160),(100,100,100),
+                (200,200,200),(120,120,120),(180,180,180),
+                (90,90,90),(150,150,150),(110,110,110)]
+        p.setPen(Qt.PenStyle.NoPen)
+        for i, (r, g, b) in enumerate(cols):
+            row, col = divmod(i, 3)
+            p.setBrush(QColor(r, g, b))
+            p.drawRect(5 + col*8, 5 + row*8, 7, 7)
+        p.end(); return px
+
+    def _make_icon_text(self):
+        px, p = self._blank_icon()
+        p.setPen(QColor(230, 126, 34))   # orange #e67e22
+        font = QFont("Georgia", 20, QFont.Weight.Bold)
+        p.setFont(font)
+        p.drawText(QRect(0, 0, 34, 34),
+                   Qt.AlignmentFlag.AlignCenter, "T")
+        p.end(); return px
+
+    def _make_icon_straight(self):
+        px, p = self._blank_icon()
+        # Double-headed arrow (horizontal)
+        pen = QPen(QColor(40, 40, 40), 2.5, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPoint(4, 17), QPoint(30, 17))
+        p.setBrush(QColor(40, 40, 40))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(QPolygon([QPoint(4, 17), QPoint(10, 13), QPoint(10, 21)]))
+        p.drawPolygon(QPolygon([QPoint(30, 17), QPoint(24, 13), QPoint(24, 21)]))
+        p.end(); return px
+
+    def _make_icon_measure_line(self):
+        px, p = self._blank_icon()
+        # Orange diagonal line with tick marks at each end
+        pen = QPen(QColor(230, 126, 34), 2.5, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPoint(6, 28), QPoint(28, 6))
+        # end ticks
+        p.drawLine(QPoint(4, 26), QPoint(9, 31))
+        p.drawLine(QPoint(26, 4), QPoint(31, 9))
+        p.end(); return px
+
+    def _make_icon_measure_rect(self):
+        px, p = self._blank_icon()
+        # Orange dashed rectangle
+        pen = QPen(QColor(230, 126, 34), 2.0, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(4, 8, 26, 18)
+        # small arrows on width/height
+        p.setPen(QPen(QColor(230, 126, 34), 1.5))
+        p.drawLine(QPoint(17, 26), QPoint(17, 30))  # height arrow down
+        p.drawLine(QPoint(30, 17), QPoint(34, 17))  # width arrow right
+        p.end(); return px
+
+    def _make_icon_stamp(self):
+        px, p = self._blank_icon()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Pin head circle (orange)
+        p.setBrush(QColor(230, 126, 34))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPoint(17, 10), 7, 7)
+        # Pin needle
+        pen = QPen(QColor(180, 80, 10), 2.5, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPoint(17, 17), QPoint(17, 28))
+        # Small shadow dot at tip
+        p.setBrush(QColor(100, 50, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPoint(17, 29), 2, 2)
+        p.end(); return px
+
+    def _make_icon_undo(self):
+        import os
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QRectF
+        svg_path = os.path.join(os.path.dirname(__file__), 'assets', 'undo_icon.svg')
+        if os.path.exists(svg_path):
+            px = QPixmap(32, 32)
+            px.fill(Qt.GlobalColor.transparent)
+            p2 = QPainter(px)
+            p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+            QSvgRenderer(svg_path).render(p2, QRectF(0, 0, 32, 32))
+            p2.end()
+            return px
+        # Fallback
+        px, p = self._blank_icon()
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.end(); return px
+
+    def _make_icon_cancel(self):
+        px, p = self._blank_icon()
+        pen = QPen(QColor(255, 255, 255), 3, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(QPoint(9, 9), QPoint(25, 25))
+        p.drawLine(QPoint(25, 9), QPoint(9, 25))
+        p.end(); return px
+
+    def _make_icon_save(self):
+        px, p = self._blank_icon()
+        # Checkmark
+        pen = QPen(QColor(255, 255, 255), 3.5, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPolyline(QPolygon([QPoint(6, 17), QPoint(14, 25), QPoint(28, 9)]))
+        p.end(); return px
 
     def _set_mode(self, mode: str):
         self.draw_mode = mode
-        for btn in self.mode_buttons:
-            btn.setChecked(False)
+        for m, btn in self._tool_btns.items():
+            btn.setChecked(m == mode)
+        # Update cursor
         if mode == 'highlight':
-            self.highlight_btn.setChecked(True)
+            import os
+            cur_path = os.path.join(os.path.dirname(__file__), 'assets', 'highlight_cursor.cur')
+            if os.path.exists(cur_path):
+                pm = QPixmap(cur_path)
+                self.canvas.setCursor(QCursor(pm, 24, 28))
+            else:
+                self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        elif mode == 'pen':
+            # Use custom pen cursor if available
+            import os
+            cur_path = os.path.join(os.path.dirname(__file__), 'assets', 'pen_cursor.cur')
+            if os.path.exists(cur_path):
+                pm = QPixmap(cur_path)
+                self.canvas.setCursor(QCursor(pm, 24, 28))  # hotspot at nib tip
+            else:
+                self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        elif mode == 'arrow':
+            import os
+            cur_path = os.path.join(os.path.dirname(__file__), 'assets', 'arrow_cursor.cur')
+            if os.path.exists(cur_path):
+                pm = QPixmap(cur_path)
+                self.canvas.setCursor(QCursor(pm, 24, 28))
+            else:
+                self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        elif mode == 'line':
+            import os
+            cur_path = os.path.join(os.path.dirname(__file__), 'assets', 'line_cursor.cur')
+            if os.path.exists(cur_path):
+                pm = QPixmap(cur_path)
+                self.canvas.setCursor(QCursor(pm, 4, 14))
+            else:
+                self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        elif mode == 'rect':
+            import os
+            cur_path = os.path.join(os.path.dirname(__file__), 'assets', 'rect_cursor.cur')
+            if os.path.exists(cur_path):
+                pm = QPixmap(cur_path)
+                self.canvas.setCursor(QCursor(pm, 5, 7))
+            else:
+                self.canvas.setCursor(Qt.CursorShape.CrossCursor)
         elif mode == 'circle':
-            self.circle_btn.setChecked(True)
+            import os
+            cur_path = os.path.join(os.path.dirname(__file__), 'assets', 'circle_cursor.cur')
+            if os.path.exists(cur_path):
+                pm = QPixmap(cur_path)
+                self.canvas.setCursor(QCursor(pm, 16, 5))
+            else:
+                self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        elif mode == 'blur':
+            import os
+            cur_path = os.path.join(os.path.dirname(__file__), 'assets', 'blur_cursor.cur')
+            if os.path.exists(cur_path):
+                pm = QPixmap(cur_path)
+                self.canvas.setCursor(QCursor(pm, 16, 16))
+            else:
+                self.canvas.setCursor(Qt.CursorShape.SizeAllCursor)
         elif mode == 'text':
-            self.text_btn.setChecked(True)
+            self.canvas.setCursor(Qt.CursorShape.IBeamCursor)
+        elif mode in ('measure_line', 'measure_rect'):
+            self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.canvas.setCursor(Qt.CursorShape.CrossCursor)
 
-    def _on_size_changed(self, value: int):
-        self.brush_size = value
-        self.size_value.setText(str(value))
+    def _on_size_changed(self, v: int):
+        self.brush_size = v
+        self.size_value.setText(str(v))
+
+    def _push_undo(self):
+        """Snapshot current overlay onto undo stack (max 30 levels)."""
+        snap = self.overlay_pixmap.copy()
+        self._undo_stack.append(snap)
+        if len(self._undo_stack) > 30:
+            self._undo_stack.pop(0)
+
+    def _undo(self):
+        if self._undo_stack:
+            self.overlay_pixmap = self._undo_stack.pop()
+            self.preview_pixmap.fill(Qt.GlobalColor.transparent)
+            self.stroke_pixmap.fill(Qt.GlobalColor.transparent)
+            self._update_canvas()
 
     def _update_canvas(self):
-        """Composite all layers and display"""
         result = QPixmap(self.original_pixmap.size())
-        painter = QPainter(result)
-        painter.drawPixmap(0, 0, self.original_pixmap)
-        painter.drawPixmap(0, 0, self.overlay_pixmap)
-        painter.drawPixmap(0, 0, self.preview_pixmap)
-        painter.end()
-
-        # Scale for display
-        scaled = result.scaled(self.display_size, Qt.AspectRatioMode.KeepAspectRatio,
-                              Qt.TransformationMode.SmoothTransformation)
+        result.fill(Qt.GlobalColor.white)   # start opaque white, not undefined
+        p = QPainter(result)
+        p.drawPixmap(0, 0, self.original_pixmap)
+        p.drawPixmap(0, 0, self.overlay_pixmap)
+        p.drawPixmap(0, 0, self.stroke_pixmap)
+        p.drawPixmap(0, 0, self.preview_pixmap)
+        p.end()
+        scaled = result.scaled(self.display_size,
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
         self.canvas.setPixmap(scaled)
 
     def _canvas_to_image_pos(self, pos: QPoint) -> QPoint:
-        """Convert canvas position to image position"""
-        return QPoint(int(pos.x() / self.scale_factor), int(pos.y() / self.scale_factor))
+        return QPoint(int(pos.x() / self.scale_factor),
+                      int(pos.y() / self.scale_factor))
+
+    # ── event filter ─────────────────────────────────────────────────────────
 
     def eventFilter(self, obj, event):
         if obj == self.canvas:
-            if event.type() == event.Type.MouseButtonPress:
-                self._on_mouse_press(event)
-                return True
-            elif event.type() == event.Type.MouseMove:
-                self._on_mouse_move(event)
-                return True
-            elif event.type() == event.Type.MouseButtonRelease:
-                self._on_mouse_release(event)
-                return True
+            t = event.type()
+            if t == event.Type.MouseButtonPress:
+                self._on_press(event); return True
+            elif t == event.Type.MouseMove:
+                self._on_move(event); return True
+            elif t == event.Type.MouseButtonRelease:
+                self._on_release(event); return True
         return super().eventFilter(obj, event)
 
-    def _on_mouse_press(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = self._canvas_to_image_pos(event.pos())
+    # ── drawing ──────────────────────────────────────────────────────────────
 
-            if self.draw_mode == 'text':
-                # Show text input dialog
-                text, ok = QInputDialog.getText(self, "Add Text", "Enter text:")
-                if ok and text:
-                    painter = QPainter(self.overlay_pixmap)
-                    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    def _on_press(self, event: QMouseEvent):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = self._canvas_to_image_pos(event.pos())
 
-                    # Use opaque color for text
-                    text_color = QColor(self.current_color.red(), self.current_color.green(),
-                                       self.current_color.blue())
-                    painter.setPen(text_color)
+        if self.draw_mode == 'text':
+            text, ok = QInputDialog.getText(self, "Add Text", "Enter text:")
+            if ok and text:
+                self._push_undo()
+                p = QPainter(self.overlay_pixmap)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                opaque = QColor(self.current_color.red(),
+                                self.current_color.green(),
+                                self.current_color.blue())
+                p.setPen(opaque)
+                font = QFont("Segoe UI", self.brush_size)
+                font.setBold(True)
+                p.setFont(font)
+                p.drawText(pos, text)
+                p.end()
+                self._update_canvas()
+            return
 
-                    font = QFont("Segoe UI", self.brush_size)
-                    font.setBold(True)
-                    painter.setFont(font)
-                    painter.drawText(pos, text)
-                    painter.end()
-                    self._update_canvas()
+        self._push_undo()
+        self.drawing = True
+        self.start_point = pos
+        self.last_point = pos
+        self._stroke_points = []   # reset point accumulator for new stroke
+
+    def _on_move(self, event: QMouseEvent):
+        if not self.drawing:
+            return
+        pos = self._canvas_to_image_pos(event.pos())
+        mode = self.draw_mode
+
+        # ── freehand modes ──
+        if mode in ('highlight', 'pen'):
+            if mode == 'highlight':
+                # Snap to horizontal if Straight is toggled or Shift held
+                shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                if self._straight_marker or shift:
+                    pos = QPoint(pos.x(), self.start_point.y())
+
+                # Append new segment points to the stroke list
+                x0, y0 = self.last_point.x(), self.last_point.y()
+                x1, y1 = pos.x(), pos.y()
+                steps = max(abs(x1-x0), abs(y1-y0), 1)
+                for i in range(steps + 1):
+                    t = i / steps
+                    self._stroke_points.append((
+                        int(x0 + (x1-x0)*t),
+                        int(y0 + (y1-y0)*t)
+                    ))
+
+                # Redraw stroke_pixmap from scratch.
+                # Use CompositionMode_Source so overlapping ellipses SET pixels
+                # rather than blending — the whole stroke stays one flat alpha.
+                self.stroke_pixmap.fill(Qt.GlobalColor.transparent)
+                p = QPainter(self.stroke_pixmap)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                p.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_Source)
+                p.setPen(Qt.PenStyle.NoPen)
+                hi = QColor(self.current_color.red(),
+                            self.current_color.green(),
+                            self.current_color.blue(), 130)
+                p.setBrush(hi)
+                r = self.brush_size // 2
+                for (x, y) in self._stroke_points:
+                    p.drawEllipse(QPoint(x, y), r, r)
+                p.end()
             else:
-                self.drawing = True
-                self.last_point = pos
+                # pen — thin opaque line direct to overlay
+                p = QPainter(self.overlay_pixmap)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                opaque = QColor(self.current_color.red(),
+                                self.current_color.green(),
+                                self.current_color.blue())
+                pen = QPen(opaque, max(1, self.brush_size // 4),
+                           Qt.PenStyle.SolidLine,
+                           Qt.PenCapStyle.RoundCap,
+                           Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                p.drawLine(self.last_point, pos)
+                p.end()
+            self.last_point = pos
+            self._update_canvas()
+            return
 
-                if self.draw_mode == 'circle':
-                    self.circle_start = pos
+        # ── shape preview modes ──
+        self.preview_pixmap.fill(Qt.GlobalColor.transparent)
+        p = QPainter(self.preview_pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen_w = max(2, self.brush_size // 4)
 
-    def _on_mouse_move(self, event: QMouseEvent):
-        if self.drawing:
-            pos = self._canvas_to_image_pos(event.pos())
+        if mode == 'line':
+            opaque = QColor(self.current_color.red(),
+                            self.current_color.green(),
+                            self.current_color.blue())
+            pen = QPen(opaque, pen_w,
+                       Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawLine(self.start_point, pos)
 
-            if self.draw_mode == 'highlight':
-                painter = QPainter(self.overlay_pixmap)
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(self.current_color)
+        elif mode == 'arrow':
+            self._draw_arrow(p, self.start_point, pos, pen_w)
 
-                if self.straight_line:
-                    # Constrain to horizontal or vertical
-                    dx = abs(pos.x() - self.last_point.x())
-                    dy = abs(pos.y() - self.last_point.y())
-                    if dx > dy:
-                        pos = QPoint(pos.x(), self.last_point.y())
+        elif mode == 'circle':
+            pen = QPen(self.current_color, pen_w)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRect(self.start_point, pos).normalized())
+
+        elif mode == 'rect':
+            pen = QPen(self.current_color, pen_w)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(QRect(self.start_point, pos).normalized())
+
+        elif mode == 'blur':
+            # Live mosaic preview + visible double border (black + white dashes)
+            r = QRect(self.start_point, pos).normalized()
+            if r.width() > 4 and r.height() > 4:
+                self._paint_blur_preview(p, r)
+            pen1 = QPen(QColor(0, 0, 0, 200), 2, Qt.PenStyle.SolidLine)
+            pen2 = QPen(QColor(255, 255, 255, 230), 2, Qt.PenStyle.DashLine)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(pen1); p.drawRect(r)
+            p.setPen(pen2); p.drawRect(r)
+
+        elif mode == 'measure_line':
+            self._draw_measure_line_preview(p, self.start_point, pos)
+
+        elif mode == 'measure_rect':
+            shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            # Snap if: ratio is locked, OR Shift is held (nearest ratio)
+            if self._measure_aspect != 'free' or shift:
+                snapped = self._snap_aspect(self.start_point, pos)
+            else:
+                snapped = pos
+            self._draw_measure_rect_preview(p, self.start_point, snapped)
+
+        p.end()
+        self._update_canvas()
+
+    def _on_release(self, event: QMouseEvent):
+        if not self.drawing:
+            return
+        pos = self._canvas_to_image_pos(event.pos())
+        mode = self.draw_mode
+
+        if mode == 'highlight':
+            # Merge completed stroke layer into overlay, then clear stroke layer
+            p = QPainter(self.overlay_pixmap)
+            p.drawPixmap(0, 0, self.stroke_pixmap)
+            p.end()
+            self.stroke_pixmap.fill(Qt.GlobalColor.transparent)
+            self._stroke_points = []
+        elif mode == 'pen':
+            pass  # pen draws direct to overlay already
+        else:
+            # Commit shape preview to overlay
+            if mode == 'blur':
+                rect = QRect(self.start_point, pos).normalized()
+                if rect.width() > 4 and rect.height() > 4:
+                    self._apply_blur(rect)
+            elif mode in ('measure_line', 'measure_rect'):
+                if self._measure_stamp:
+                    # Stamp measurement permanently onto overlay
+                    p = QPainter(self.overlay_pixmap)
+                    if mode == 'measure_line':
+                        self._draw_measure_line_preview(p, self.start_point, pos)
                     else:
-                        pos = QPoint(self.last_point.x(), pos.y())
-
-                # Draw line of circles
-                if self.last_point:
-                    # Bresenham-style line
-                    x0, y0 = self.last_point.x(), self.last_point.y()
-                    x1, y1 = pos.x(), pos.y()
-
-                    dx = abs(x1 - x0)
-                    dy = abs(y1 - y0)
-                    steps = max(dx, dy, 1)
-
-                    for i in range(steps + 1):
-                        t = i / steps if steps > 0 else 0
-                        x = int(x0 + (x1 - x0) * t)
-                        y = int(y0 + (y1 - y0) * t)
-                        painter.drawEllipse(QPoint(x, y), self.brush_size // 2, self.brush_size // 2)
-
-                painter.end()
-                self.last_point = pos
-
-            elif self.draw_mode == 'circle':
-                # Clear preview and draw circle preview
+                        if self._measure_aspect != 'free':
+                            end = self._snap_aspect(self.start_point, pos)
+                        else:
+                            shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                            end = self._snap_aspect(self.start_point, pos) if shift else pos
+                        self._draw_measure_rect_preview(p, self.start_point, end)
+                    p.end()
+                # Either way, clear the live preview
                 self.preview_pixmap.fill(Qt.GlobalColor.transparent)
-                painter = QPainter(self.preview_pixmap)
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            else:
+                p = QPainter(self.overlay_pixmap)
+                p.drawPixmap(0, 0, self.preview_pixmap)
+                p.end()
+            self.preview_pixmap.fill(Qt.GlobalColor.transparent)
 
-                pen = QPen(self.current_color)
-                pen.setWidth(max(2, self.brush_size // 3))
-                painter.setPen(pen)
-                painter.setBrush(Qt.BrushStyle.NoBrush)
+        self.drawing = False
+        self.start_point = None
+        self.last_point = None
+        self._update_canvas()
 
-                rect = QRect(self.circle_start, pos).normalized()
-                painter.drawEllipse(rect)
-                painter.end()
+    # ── arrow helper ─────────────────────────────────────────────────────────
 
-            self._update_canvas()
+    def _draw_arrow(self, painter: QPainter, src: QPoint, dst: QPoint, pen_w: int):
+        import math
+        opaque = QColor(self.current_color.red(),
+                        self.current_color.green(),
+                        self.current_color.blue())
+        pen = QPen(opaque, pen_w, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(opaque))
 
-    def _on_mouse_release(self, event: QMouseEvent):
-        if self.drawing:
-            if self.draw_mode == 'circle':
-                # Commit preview to overlay
-                painter = QPainter(self.overlay_pixmap)
-                painter.drawPixmap(0, 0, self.preview_pixmap)
-                painter.end()
-                self.preview_pixmap.fill(Qt.GlobalColor.transparent)
+        dx = dst.x() - src.x()
+        dy = dst.y() - src.y()
+        length = math.hypot(dx, dy)
+        if length < 4:
+            return
 
-            self.drawing = False
-            self.last_point = None
-            self._update_canvas()
+        # Shaft
+        painter.drawLine(src, dst)
+
+        # Arrowhead — equilateral triangle at dst
+        head = max(12, pen_w * 4)
+        angle = math.atan2(dy, dx)
+        spread = math.pi / 6   # 30°
+        ax1 = dst.x() - head * math.cos(angle - spread)
+        ay1 = dst.y() - head * math.sin(angle - spread)
+        ax2 = dst.x() - head * math.cos(angle + spread)
+        ay2 = dst.y() - head * math.sin(angle + spread)
+
+        tri = QPolygon([dst,
+                        QPoint(int(ax1), int(ay1)),
+                        QPoint(int(ax2), int(ay2))])
+        painter.drawPolygon(tri)
+
+    # ── blur helper ──────────────────────────────────────────────────────────
+
+    def _paint_blur_preview(self, painter: QPainter, rect: QRect):
+        """Paint a live mosaic preview into an already-open painter (preview layer)."""
+        tile = max(4, self.brush_size // 3)
+        region = self.original_pixmap.copy(rect)
+        small = region.scaled(
+            max(1, rect.width() // tile), max(1, rect.height() // tile),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.FastTransformation)
+        mosaic = small.scaled(
+            rect.width(), rect.height(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.FastTransformation)
+        painter.drawPixmap(rect.topLeft(), mosaic)
+
+    def _apply_blur(self, rect: QRect):
+        """Commit pixelated mosaic onto overlay layer."""
+        tile = max(4, self.brush_size // 3)
+        region = self.original_pixmap.copy(rect)
+        small = region.scaled(
+            max(1, rect.width() // tile), max(1, rect.height() // tile),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.FastTransformation)
+        mosaic = small.scaled(
+            rect.width(), rect.height(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.FastTransformation)
+        p = QPainter(self.overlay_pixmap)
+        # Use SourceOver so it paints opaque pixels onto the transparent overlay
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        p.drawPixmap(rect.topLeft(), mosaic)
+        p.end()
+
+    # ── measure helpers ──────────────────────────────────────────────────────
+
+    # Common aspect ratios for Shift-snap (width:height)
+    _ASPECT_RATIOS = [(16,9),(4,3),(1,1),(3,2),(21,9),(9,16),(2,3)]
+
+    def _show_aspect_menu(self, pos=None):
+        """Show aspect ratio dropdown on the measure_rect button."""
+        from PyQt6.QtWidgets import QMenu
+        btn = self._tool_btns['measure_rect']
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background:#f0f0f0; border:1px solid #bbb; }
+            QMenu::item { padding:5px 22px; color:#222; }
+            QMenu::item:selected { background:#e67e22; color:white; }
+            QMenu::item:checked { font-weight:bold; }
+        """)
+        for label, key in self._aspect_ratios:
+            act = menu.addAction(('✓ ' if self._measure_aspect == key else '   ') + label)
+            act.setData(key)
+        chosen = menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        if chosen:
+            self._measure_aspect = chosen.data()
+            # Update tooltip to show current lock
+            label = next(l for l, k in self._aspect_ratios if k == self._measure_aspect)
+            self._tool_btns['measure_rect'].setToolTip(
+                f'📐 Measure rect  [shift+M]  —  {label}')
+        self._set_mode('measure_rect')
+
+    def _show_aspect_menu_on_click(self):
+        """Left-clicking measure_rect always shows the aspect menu too."""
+        self._show_aspect_menu()
+
+    def _snap_aspect(self, start: QPoint, end: QPoint) -> QPoint:
+        """Snap end point to the locked aspect ratio (or nearest if free)."""
+        w = abs(end.x() - start.x())
+        h = abs(end.y() - start.y())
+        if w < 4 or h < 4:
+            return end
+
+        # Determine target ratio
+        if self._measure_aspect == 'free':
+            # Snap to nearest common ratio
+            current_ratio = w / h
+            best = min(self._ASPECT_RATIOS, key=lambda r: abs(r[0]/r[1] - current_ratio))
+            ar = best[0] / best[1]
+        else:
+            parts = self._measure_aspect.split(':')
+            ar = int(parts[0]) / int(parts[1])
+
+        # Constrain to fit within dragged area
+        if w / ar >= h:
+            new_h = int(w / ar)
+            new_w = w
+        else:
+            new_w = int(h * ar)
+            new_h = h
+        dx = new_w if end.x() >= start.x() else -new_w
+        dy = new_h if end.y() >= start.y() else -new_h
+        return QPoint(start.x() + dx, start.y() + dy)
+
+    def _measure_label_style(self, p: QPainter):
+        """Set up painter for measurement text labels."""
+        p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+
+    def _draw_label_box(self, p: QPainter, text: str, cx: int, cy: int):
+        """Draw a dark pill label with white text centred at cx,cy."""
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(text)
+        th = fm.height()
+        pad_x, pad_y = 6, 3
+        box = QRect(cx - tw//2 - pad_x, cy - th//2 - pad_y,
+                    tw + pad_x*2, th + pad_y*2)
+        # Dark semi-transparent background
+        p.setBrush(QColor(20, 20, 20, 210))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(box, 4, 4)
+        # White text
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _draw_measure_line_preview(self, p: QPainter, a: QPoint, b: QPoint):
+        """Draw a measurement line with pixel length label."""
+        # Orange line
+        pen = QPen(QColor(230, 126, 34), 2, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(a, b)
+        # End ticks (perpendicular to line)
+        import math
+        dx = b.x() - a.x(); dy = b.y() - a.y()
+        length = math.hypot(dx, dy)
+        if length < 2:
+            return
+        nx, ny = -dy/length, dx/length   # normal vector
+        tick = 6
+        for pt in (a, b):
+            p.drawLine(
+                QPoint(int(pt.x() + nx*tick), int(pt.y() + ny*tick)),
+                QPoint(int(pt.x() - nx*tick), int(pt.y() - ny*tick)))
+        # Pixel length label at midpoint
+        px_len = int(length)
+        self._measure_label_style(p)
+        mx, my = (a.x()+b.x())//2, (a.y()+b.y())//2
+        self._draw_label_box(p, f"{px_len} px", mx, my - 14)
+
+    def _draw_measure_rect_preview(self, p: QPainter, a: QPoint, b: QPoint):
+        """Draw a measurement rectangle with W×H, aspect ratio, and MP labels."""
+        r = QRect(a, b).normalized()
+        if r.width() < 2 or r.height() < 2:
+            return
+        w, h = r.width(), r.height()
+        # Dashed orange border
+        pen = QPen(QColor(230, 126, 34), 2, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(r)
+        # Corner crosshairs
+        p.setPen(QPen(QColor(230, 126, 34), 1.5))
+        for cx, cy in [(r.left(), r.top()), (r.right(), r.top()),
+                       (r.left(), r.bottom()), (r.right(), r.bottom())]:
+            p.drawLine(cx-6, cy, cx+6, cy)
+            p.drawLine(cx, cy-6, cx, cy+6)
+        # Compute aspect ratio string
+        import math
+        g = math.gcd(w, h)
+        ratio_w, ratio_h = w//g, h//g
+        # If a ratio is locked, show that name; otherwise resolve from actual dimensions
+        if self._measure_aspect != 'free':
+            ratio_str = '🔒 ' + self._measure_aspect
+        else:
+            named = {(16,9):'16:9',(4,3):'4:3',(1,1):'1:1',(3,2):'3:2',
+                     (21,9):'21:9',(9,16):'9:16',(2,3):'2:3'}
+            ratio_str = named.get((ratio_w, ratio_h), f'{ratio_w}:{ratio_h}')
+        mp = w * h / 1_000_000
+        self._measure_label_style(p)
+        # W×H label above top edge
+        self._draw_label_box(p, f"{w} × {h} px", r.center().x(), r.top() - 14)
+        # Aspect + MP label below bottom edge
+        mp_str = f"{mp:.2f} MP" if mp >= 0.1 else f"{w*h} px²"
+        self._draw_label_box(p, f"{ratio_str}  ·  {mp_str}",
+                             r.center().x(), r.bottom() + 14)
+
+    # ── save / cancel ────────────────────────────────────────────────────────
 
     def _save(self):
-        # Composite final image
         result = QPixmap(self.original_pixmap.size())
-        painter = QPainter(result)
-        painter.drawPixmap(0, 0, self.original_pixmap)
-        painter.drawPixmap(0, 0, self.overlay_pixmap)
-        painter.end()
-
+        p = QPainter(result)
+        p.drawPixmap(0, 0, self.original_pixmap)
+        p.drawPixmap(0, 0, self.overlay_pixmap)
+        p.end()
         self.editing_complete.emit(result)
         self.close()
 
@@ -1618,8 +3376,21 @@ class ScreenshotEditor(QMainWindow):
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Escape:
             self._cancel()
-        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._save()
+        elif event.modifiers() & Qt.KeyboardModifier.ControlModifier and \
+             event.key() == Qt.Key.Key_Z:
+            self._undo()
+        # Keyboard shortcuts for tools
+        shortcuts = {
+            Qt.Key.Key_H: 'highlight', Qt.Key.Key_P: 'pen',
+            Qt.Key.Key_L: 'line',      Qt.Key.Key_A: 'arrow',
+            Qt.Key.Key_R: 'rect',      Qt.Key.Key_C: 'circle',
+            Qt.Key.Key_B: 'blur',      Qt.Key.Key_T: 'text',
+            Qt.Key.Key_M: 'measure_rect' if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 'measure_line',
+        }
+        if event.key() in shortcuts:
+            self._set_mode(shortcuts[event.key()])
 
 
 # ============================================================================
@@ -1634,7 +3405,7 @@ class SettingsDialog(QDialog):
         self.config = config.copy()
 
         self.setWindowTitle("Settings")
-        self.setFixedSize(400, 550)
+        self.setFixedSize(420, 600)
         self.setStyleSheet(f"background: {Theme.BG_LIGHT};")
 
         layout = QVBoxLayout(self)
@@ -1712,6 +3483,12 @@ class SettingsDialog(QDialog):
             self.pin_check.setToolTip("Install pyvda package for this feature")
         layout.addWidget(self.pin_check)
 
+        # Floating bar toggle
+        self.floating_bar_check = QCheckBox("Show floating capture bar (all desktops)")
+        self.floating_bar_check.setChecked(config.get('floating_bar_visible', True))
+        self.floating_bar_check.setStyleSheet(f"color: {Theme.TEXT_DARK};")
+        layout.addWidget(self.floating_bar_check)
+
         # Thumbnail size
         thumb_frame = QFrame()
         thumb_layout = QHBoxLayout(thumb_frame)
@@ -1735,26 +3512,120 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(thumb_frame)
 
+        # Folder preview thumbnail size
+        folder_thumb_frame = QFrame()
+        folder_thumb_layout = QHBoxLayout(folder_thumb_frame)
+        folder_thumb_layout.setContentsMargins(0, 0, 0, 0)
+
+        folder_thumb_label = QLabel("Folder thumb size:")
+        folder_thumb_label.setStyleSheet(f"color: {Theme.TEXT_DARK};")
+        folder_thumb_layout.addWidget(folder_thumb_label)
+
+        self.folder_thumb_slider = QSlider(Qt.Orientation.Horizontal)
+        self.folder_thumb_slider.setRange(1, 10)
+        self.folder_thumb_slider.setValue(config.get('folder_thumbnail_scale', 5))
+        self.folder_thumb_slider.setFixedWidth(150)
+        folder_thumb_layout.addWidget(self.folder_thumb_slider)
+
+        self.folder_thumb_value = QLabel(str(config.get('folder_thumbnail_scale', 5)))
+        self.folder_thumb_value.setStyleSheet(f"color: {Theme.TEXT_DARK};")
+        self.folder_thumb_slider.valueChanged.connect(lambda v: self.folder_thumb_value.setText(str(v)))
+        folder_thumb_layout.addWidget(self.folder_thumb_value)
+        folder_thumb_layout.addStretch()
+
+        layout.addWidget(folder_thumb_frame)
+
         # Auto-send section
         layout.addSpacing(10)
-        autosend_label = QLabel("Auto-send")
+        autosend_label = QLabel("Send Targets")
         autosend_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
         autosend_label.setStyleSheet(f"color: {Theme.TEXT_DARK};")
         layout.addWidget(autosend_label)
 
-        self.autosend_check = QCheckBox("Auto-send to:")
+        # Target list
+        self.targets_list = QListWidget()
+        self.targets_list.setFixedHeight(110)
+        self.targets_list.setStyleSheet(f"""
+            QListWidget {{
+                background: {Theme.BG_CONTENT};
+                color: {Theme.TEXT_DARK};
+                border: 1px solid {Theme.TEXT_MUTED};
+                border-radius: 4px;
+                font-size: 12px;
+            }}
+            QListWidget::item:selected {{
+                background: {Theme.BG_DARK};
+                color: white;
+            }}
+        """)
+        self._targets_data = list(config.get('push_targets', []))
+        self._refresh_targets_list()
+        layout.addWidget(self.targets_list)
+
+        # Add / Remove buttons
+        btn_row = QFrame()
+        btn_layout = QHBoxLayout(btn_row)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(6)
+
+        add_btn = QPushButton("+ Add from open windows...")
+        add_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {Theme.BG_DARK};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {Theme.BG_DARKER}; }}
+        """)
+        add_btn.clicked.connect(self._add_target_from_windows)
+        btn_layout.addWidget(add_btn)
+
+        remove_btn = QPushButton("Remove")
+        remove_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #c0392b;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{ background: #a93226; }}
+        """)
+        remove_btn.clicked.connect(self._remove_selected_target)
+        btn_layout.addWidget(remove_btn)
+
+        edit_btn = QPushButton("Edit")
+        edit_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #7d6608;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{ background: #9a7d0a; }}
+        """)
+        edit_btn.clicked.connect(self._edit_selected_target)
+        btn_layout.addWidget(edit_btn)
+        btn_layout.addStretch()
+
+        layout.addWidget(btn_row)
+
+        # Auto-send toggle
+        layout.addSpacing(6)
+        self.autosend_check = QCheckBox("Auto-send on capture to:")
         self.autosend_check.setChecked(config.get('auto_send_enabled', False))
         self.autosend_check.setStyleSheet(f"color: {Theme.TEXT_DARK};")
         layout.addWidget(self.autosend_check)
 
         self.target_combo = QComboBox()
-        targets = config.get('push_targets', [])
-        for t in targets:
-            self.target_combo.addItem(t.get('name', 'Unknown'))
-        current_target = config.get('auto_send_target', '')
-        idx = self.target_combo.findText(current_target)
-        if idx >= 0:
-            self.target_combo.setCurrentIndex(idx)
+        self.target_combo.setStyleSheet(f"color: {Theme.TEXT_DARK}; background: {Theme.BG_CONTENT};")
+        self._refresh_target_combo(config.get('auto_send_target', ''))
         layout.addWidget(self.target_combo)
 
         # Storage section
@@ -1799,7 +3670,48 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(archive_frame)
 
-        # Save location
+        # OCR / Search index section
+        layout.addSpacing(10)
+        ocr_label = QLabel("Text Search (OCR)")
+        ocr_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        ocr_label.setStyleSheet(f"color: {Theme.TEXT_DARK};")
+        layout.addWidget(ocr_label)
+
+        ocr_info = QLabel(
+            "Index all existing screenshots so they can be found by text search.\n"
+            "New captures are indexed automatically in the background."
+        )
+        ocr_info.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 9pt;")
+        ocr_info.setWordWrap(True)
+        layout.addWidget(ocr_info)
+
+        reindex_row = QFrame()
+        reindex_layout = QHBoxLayout(reindex_row)
+        reindex_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.reindex_btn = QPushButton("Re-index all screenshots")
+        self.reindex_btn.setEnabled(OCR_AVAILABLE)
+        self.reindex_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {Theme.BG_DARK};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {Theme.BG_DARKER}; }}
+            QPushButton:disabled {{ background: #555; color: #999; }}
+        """)
+        self.reindex_btn.clicked.connect(self._start_reindex)
+        reindex_layout.addWidget(self.reindex_btn)
+
+        self.reindex_status = QLabel("" if OCR_AVAILABLE else "Tesseract not found")
+        self.reindex_status.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 10px;")
+        reindex_layout.addWidget(self.reindex_status)
+        reindex_layout.addStretch()
+
+        layout.addWidget(reindex_row)
         layout.addSpacing(10)
         loc_label = QLabel("Save location")
         loc_label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
@@ -1874,6 +3786,192 @@ class SettingsDialog(QDialog):
         path = self.config.get('save_dir', SAVE_DIR)
         os.startfile(str(path))
 
+    def _refresh_targets_list(self):
+        """Repopulate the targets QListWidget from self._targets_data"""
+        self.targets_list.clear()
+        for t in self._targets_data:
+            self.targets_list.addItem(f"{t.get('name', '?')}  —  {t.get('title_pattern', '')}")
+
+    def _refresh_target_combo(self, current=''):
+        """Repopulate the auto-send combo from self._targets_data"""
+        self.target_combo.clear()
+        for t in self._targets_data:
+            self.target_combo.addItem(t.get('name', 'Unknown'))
+        idx = self.target_combo.findText(current)
+        if idx >= 0:
+            self.target_combo.setCurrentIndex(idx)
+
+    def _add_target_from_windows(self):
+        """Show a dialog listing all visible windows; let user pick one as a new send target"""
+        # Collect all visible, titled windows
+        windows = []
+        def _enum(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd).strip()
+                if title and len(title) > 2:
+                    windows.append(title)
+        win32gui.EnumWindows(_enum, None)
+        windows = sorted(set(windows))
+
+        if not windows:
+            StyledDialog.info(self, "No windows", "No visible windows found.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add Send Target")
+        dlg.setMinimumWidth(420)
+        vlay = QVBoxLayout(dlg)
+
+        vlay.addWidget(QLabel("Select an open window:"))
+        combo = QComboBox()
+        combo.addItems(windows)
+        vlay.addWidget(combo)
+
+        vlay.addWidget(QLabel("Name for this target:"))
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("e.g. Claude Browser")
+        vlay.addWidget(name_edit)
+
+        # Auto-fill name when window selection changes — strip app suffixes
+        def _smart_name(title):
+            """Extract the app name from a window title, stripping doc/url prefixes."""
+            import re
+            # Common patterns: "Doc name - App Name" or "App Name"
+            # Strip trailing separators and known browser/editor suffixes
+            suffixes = [
+                r'\s*[-–|]\s*Google Chrome$', r'\s*[-–|]\s*Mozilla Firefox$',
+                r'\s*[-–|]\s*Microsoft Edge$', r'\s*[-–|]\s*Opera$',
+                r'\s*[-–|]\s*Visual Studio Code$', r'\s*[-–|]\s*Notepad\+\+$',
+                r'\s*[-–|]\s*Notepad$', r'\s*[-–|]\s*Slack$',
+                r'\s*[-–|]\s*Discord$', r'\s*[-–|]\s*WhatsApp$',
+            ]
+            result = title
+            for pat in suffixes:
+                result = re.sub(pat, '', result, flags=re.IGNORECASE).strip()
+            # If stripping left nothing useful, fall back to last segment after " - "
+            if not result:
+                parts = re.split(r'\s*[-–|]\s*', title)
+                result = parts[-1].strip() if parts else title
+            # If still long, take the last " - " segment (usually the app name)
+            if len(result) > 40:
+                parts = re.split(r'\s*[-–|]\s*', result)
+                result = parts[-1].strip() if len(parts) > 1 else result[:40]
+            return result[:40]
+
+        def _fill_name(text):
+            # Always update to keep suggestion fresh; user can still edit
+            name_edit.setText(_smart_name(text))
+        combo.currentTextChanged.connect(_fill_name)
+        _fill_name(combo.currentText())
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        vlay.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        window_title = combo.currentText()
+        name = name_edit.text().strip() or window_title[:40]
+
+        # Build a title_pattern from the window title (lower, first 40 chars)
+        pattern = window_title.lower()[:60]
+
+        # Avoid duplicates by name
+        existing_names = {t.get('name', '').lower() for t in self._targets_data}
+        if name.lower() in existing_names:
+            StyledDialog.warning(self, "Duplicate", f"A target named '{name}' already exists.")
+            return
+
+        self._targets_data.append({'name': name, 'title_pattern': pattern, 'enabled': True})
+        self._refresh_targets_list()
+        current_auto = self.target_combo.currentText()
+        self._refresh_target_combo(current_auto)
+
+    def _edit_selected_target(self):
+        """Edit name and title_pattern of the selected target"""
+        row = self.targets_list.currentRow()
+        if row < 0:
+            StyledDialog.info(self, "Nothing selected", "Select a target to edit.")
+            return
+
+        target = self._targets_data[row]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Send Target")
+        dlg.setMinimumWidth(400)
+        vlay = QVBoxLayout(dlg)
+
+        vlay.addWidget(QLabel("Name:"))
+        name_edit = QLineEdit(target.get('name', ''))
+        vlay.addWidget(name_edit)
+
+        vlay.addWidget(QLabel("Window title pattern (lowercase, partial match):"))
+        pattern_edit = QLineEdit(target.get('title_pattern', ''))
+        pattern_edit.setToolTip(
+            "The app window must contain this text in its title.\n"
+            "Use | to match multiple alternatives, e.g. 'claude|chatgpt'"
+        )
+        vlay.addWidget(pattern_edit)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        vlay.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_name = name_edit.text().strip()
+        new_pattern = pattern_edit.text().strip().lower()
+
+        if not new_name or not new_pattern:
+            StyledDialog.warning(self, "Invalid", "Name and pattern cannot be empty.")
+            return
+
+        # Check for duplicate name (ignoring the current row)
+        for i, t in enumerate(self._targets_data):
+            if i != row and t.get('name', '').lower() == new_name.lower():
+                StyledDialog.warning(self, "Duplicate", f"A target named '{new_name}' already exists.")
+                return
+
+        self._targets_data[row] = {**target, 'name': new_name, 'title_pattern': new_pattern}
+        current_auto = self.target_combo.currentText()
+        self._refresh_targets_list()
+        self._refresh_target_combo(current_auto)
+        self.targets_list.setCurrentRow(row)
+
+    def _remove_selected_target(self):
+        """Remove the currently selected target from the list"""
+        row = self.targets_list.currentRow()
+        if row < 0:
+            StyledDialog.info(self, "Nothing selected", "Select a target to remove.")
+            return
+        name = self._targets_data[row].get('name', '')
+        reply = StyledDialog.question(self, "Remove target", f"Remove '{name}' from send targets?")
+        if reply:
+            del self._targets_data[row]
+            self._refresh_targets_list()
+            current_auto = self.target_combo.currentText()
+            self._refresh_target_combo(current_auto)
+
+    def _start_reindex(self):
+        """Launch ReindexWorker to OCR all existing screenshots."""
+        self.reindex_btn.setEnabled(False)
+        self.reindex_status.setText("Starting…")
+        save_dir = Path(self.config.get('save_dir', SAVE_DIR))
+        index = OcrIndex(save_dir / "ocr_index.db")
+        self._reindex_worker = ReindexWorker(save_dir, index)
+        self._reindex_worker.progress.connect(
+            lambda done, total: self.reindex_status.setText(f"{done}/{total}"))
+        self._reindex_worker.finished.connect(self._on_reindex_done)
+        self._reindex_worker.start()
+
+    def _on_reindex_done(self, count: int):
+        self.reindex_status.setText(f"Done — {count} files processed")
+        self.reindex_btn.setEnabled(OCR_AVAILABLE)
+
     def _save(self):
         # Update config
         self.config['theme'] = self.theme_combo.currentData()
@@ -1882,9 +3980,12 @@ class SettingsDialog(QDialog):
         self.config['edit_before_save'] = self.edit_check.isChecked()
         self.config['silent_capture'] = self.silent_check.isChecked()
         self.config['pin_to_all_desktops'] = self.pin_check.isChecked()
+        self.config['floating_bar_visible'] = self.floating_bar_check.isChecked()
         self.config['thumbnail_scale'] = self.thumb_slider.value()
+        self.config['folder_thumbnail_scale'] = self.folder_thumb_slider.value()
         self.config['auto_send_enabled'] = self.autosend_check.isChecked()
         self.config['auto_send_target'] = self.target_combo.currentText()
+        self.config['push_targets'] = self._targets_data
         self.config['disk_limit_mb'] = self.limit_spin.value()
         self.config['archive_days'] = self.archive_spin.value()
 
@@ -1903,29 +4004,126 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        _trace_startup("MainWindow.__init__ start")
 
         # State
         self.current_folder: Optional[str] = None
         self.capture_in_progress = False
         self.session_count = 0
+        self._cached_storage_bytes: Optional[int] = None
+        self._thumb_pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
+        self._thumb_cache_max_entries = 500
+        self._last_gallery_images: List[Path] = []
+        self._resize_margin = 8
+        self._use_native_resize_hit_test = False  # stability-first: disable crash-prone hook
+        # Qt6 + Python 3.14 has shown native crashes on first show() when frameless is enabled.
+        # Keep startup stable by default; allow explicit opt-in for testing.
+        force_frameless = os.environ.get("OTTERLY_FORCE_FRAMELESS", "").strip() == "1"
+        self._use_frameless_main_window = force_frameless or (sys.version_info < (3, 14))
+        self._use_minimal_styles = False
 
         # Load config
         self.config = self._load_config()
         self.save_dir = Path(self.config.get('save_dir', SAVE_DIR))
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
+        # OCR index
+        self.ocr_index = OcrIndex(self.save_dir / "ocr_index.db")
+        self._ocr_workers: List[OcrWorker] = []  # keep refs alive
+        self._search_query: str = ""
+        self._desktop_target_override: Optional[str] = None  # set by FloatingBar
+
         # Setup UI
         self._setup_ui()
+        _trace_startup("MainWindow._setup_ui complete")
 
-        # Register hotkeys
-        self._register_hotkeys()
+        # Delay hotkey registration until after the main window is visible to avoid early hook crashes.
+        _trace_startup("MainWindow hotkey registration deferred")
 
-        # Initial gallery refresh
-        QTimer.singleShot(100, self._refresh_gallery)
+        # Initial UI/data refresh
+        if not self._use_minimal_styles:
+            QTimer.singleShot(100, self._refresh_folder_bar)
+            QTimer.singleShot(100, self._refresh_gallery)
 
-        # Pin to all virtual desktops after window is shown
+        # Pin main window to all virtual desktops after window is shown
         if self.config.get('pin_to_all_desktops', False):
             QTimer.singleShot(500, self._pin_to_all_desktops)
+
+        # Floating capture bar must be available independently of the main window.
+        self.floating_bar = FloatingBar(self)
+        if self.config.get('floating_bar_visible', True):
+            QTimer.singleShot(400, self.floating_bar.show)
+        _trace_startup("MainWindow.__init__ complete")
+
+    def _ensure_floating_bar(self):
+        """Create/show the floating capture bar after startup is fully visible."""
+        if self.floating_bar is None:
+            self.floating_bar = FloatingBar(self)
+        if self.config.get('floating_bar_visible', True):
+            self.floating_bar.show()
+            print(f"[Otterly] Floating bar shown at ({self.floating_bar.x()}, {self.floating_bar.y()})", flush=True)
+
+    def nativeEvent(self, eventType, message):
+        """Native Windows hit-testing for reliable edge/corner resize in frameless mode."""
+        if sys.platform != "win32" or not self._use_native_resize_hit_test:
+            return False, 0
+
+        try:
+            WM_NCHITTEST = 0x0084
+            HTLEFT = 10
+            HTRIGHT = 11
+            HTTOP = 12
+            HTTOPLEFT = 13
+            HTTOPRIGHT = 14
+            HTBOTTOM = 15
+            HTBOTTOMLEFT = 16
+            HTBOTTOMRIGHT = 17
+
+            class MSG(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd", ctypes.c_void_p),
+                    ("message", ctypes.c_uint),
+                    ("wParam", ctypes.c_void_p),
+                    ("lParam", ctypes.c_void_p),
+                    ("time", ctypes.c_uint),
+                    ("pt_x", ctypes.c_long),
+                    ("pt_y", ctypes.c_long),
+                ]
+
+            msg = MSG.from_address(int(message))
+            if msg.message == WM_NCHITTEST and not self.isMaximized():
+                lparam = int(msg.lParam)
+                x = ctypes.c_short(lparam & 0xFFFF).value
+                y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+
+                fg = self.frameGeometry()
+                m = self._resize_margin
+
+                on_left = fg.left() <= x <= fg.left() + m
+                on_right = fg.right() - m <= x <= fg.right()
+                on_top = fg.top() <= y <= fg.top() + m
+                on_bottom = fg.bottom() - m <= y <= fg.bottom()
+
+                if on_top and on_left:
+                    return True, HTTOPLEFT
+                if on_top and on_right:
+                    return True, HTTOPRIGHT
+                if on_bottom and on_left:
+                    return True, HTBOTTOMLEFT
+                if on_bottom and on_right:
+                    return True, HTBOTTOMRIGHT
+                if on_left:
+                    return True, HTLEFT
+                if on_right:
+                    return True, HTRIGHT
+                if on_top:
+                    return True, HTTOP
+                if on_bottom:
+                    return True, HTBOTTOM
+        except Exception as e:
+            logging.error(f"nativeEvent resize handling failed: {e}")
+
+        return False, 0
 
     def _load_config(self) -> dict:
         """Load configuration from JSON file"""
@@ -1937,6 +4135,7 @@ class MainWindow(QMainWindow):
             'silent_capture': False,
             'pin_to_all_desktops': False,
             'thumbnail_scale': 5,
+            'folder_thumbnail_scale': 5,
             'auto_send_enabled': False,
             'auto_send_target': '',
             'disk_limit_mb': 500,
@@ -1952,7 +4151,8 @@ class MainWindow(QMainWindow):
 
         if CONFIG_FILE.exists():
             try:
-                with open(CONFIG_FILE, 'r') as f:
+                # Use utf-8-sig so BOM-prefixed JSON files still load correctly.
+                with open(CONFIG_FILE, 'r', encoding='utf-8-sig') as f:
                     loaded = json.load(f)
                     default_config.update(loaded)
             except Exception as e:
@@ -1966,17 +4166,27 @@ class MainWindow(QMainWindow):
     def _save_config(self):
         """Save configuration to JSON file"""
         try:
-            with open(CONFIG_FILE, 'w') as f:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=2)
         except Exception as e:
             logging.error(f"Failed to save config: {e}")
 
     def _setup_ui(self):
         """Setup the main UI"""
-        # Frameless window
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        # Use native window frame for startup stability (frameless can be force-enabled via env var).
+        if self._use_frameless_main_window:
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setWindowTitle(APP_NAME)
         self.setGeometry(100, 100, 900, 650)
-        self.setStyleSheet(generate_stylesheet())
+        self.setMinimumSize(840, 560)
+        if self._use_minimal_styles:
+            self.setStyleSheet("")
+        else:
+            self.setStyleSheet(generate_stylesheet())
+
+        if self._use_minimal_styles:
+            self._setup_ui_compat()
+            return
 
         # Set window icon
         logo_path = Path(__file__).parent / "logo.png"
@@ -1993,12 +4203,18 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
 
         # Title bar
-        self.title_bar = CustomTitleBar(self)
+        if self._use_frameless_main_window:
+            self.title_bar = CustomTitleBar(self, show_window_controls=True)
+        else:
+            self.title_bar = SimpleTitleBar(self)
+        self.title_bar.search_edit.textChanged.connect(self._on_search_changed)
         main_layout.addWidget(self.title_bar)
 
         # Content area with splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(1)
+        splitter.setHandleWidth(10)
+        splitter.setChildrenCollapsible(False)
+        self.main_splitter = splitter
 
         # Sidebar
         sidebar = self._create_sidebar()
@@ -2011,11 +4227,84 @@ class MainWindow(QMainWindow):
         splitter.setSizes([200, 700])
         main_layout.addWidget(splitter)
 
-        # Status bar
+        # Status bar + resize grip
+        status_container = QFrame()
+        status_container.setObjectName("statusBar")
+        status_container.setFixedHeight(30)
+        status_layout = QHBoxLayout(status_container)
+        status_layout.setContentsMargins(10, 0, 4, 0)
+        status_layout.setSpacing(6)
+
         self.status_bar = QLabel("Ready")
-        self.status_bar.setObjectName("statusBar")
-        self.status_bar.setFixedHeight(30)
-        main_layout.addWidget(self.status_bar)
+        status_layout.addWidget(self.status_bar)
+        status_layout.addStretch()
+
+        self.size_grip = QSizeGrip(status_container)
+        self.size_grip.setFixedSize(20, 20)
+        self.size_grip.setToolTip("Resize window")
+        status_layout.addWidget(self.size_grip, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+
+        main_layout.addWidget(status_container)
+
+    def _setup_ui_compat(self):
+        """Compatibility UI for Python 3.14 startup stability."""
+        container = QWidget()
+        self.setCentralWidget(container)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        title = QLabel(APP_NAME)
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        layout.addWidget(title)
+
+        info = QLabel("Compatibility mode: UI trimmed for startup stability on Python 3.14")
+        info.setStyleSheet("color: #666;")
+        layout.addWidget(info)
+
+        btn_row = QHBoxLayout()
+        region_btn = QPushButton("Region")
+        region_btn.clicked.connect(self._start_region_capture)
+        btn_row.addWidget(region_btn)
+
+        screen_btn = QPushButton("Screen")
+        screen_btn.clicked.connect(self._capture_fullscreen)
+        btn_row.addWidget(screen_btn)
+
+        window_btn = QPushButton("Window")
+        window_btn.clicked.connect(self._start_window_capture)
+        btn_row.addWidget(window_btn)
+        layout.addLayout(btn_row)
+
+        utility_row = QHBoxLayout()
+        settings_btn = QPushButton("Settings")
+        settings_btn.clicked.connect(self._show_settings)
+        utility_row.addWidget(settings_btn)
+
+        import_btn = QPushButton("Import")
+        import_btn.clicked.connect(self._import_image)
+        utility_row.addWidget(import_btn)
+
+        paste_btn = QPushButton("Paste")
+        paste_btn.clicked.connect(self._paste_from_clipboard)
+        utility_row.addWidget(paste_btn)
+        layout.addLayout(utility_row)
+
+        self.status_bar = QLabel("Ready")
+        layout.addWidget(self.status_bar)
+
+        self.session_label = QLabel("Screenshots: 0")
+        layout.addWidget(self.session_label)
+
+        self.disk_label = QLabel("Storage info available in full UI mode")
+        layout.addWidget(self.disk_label)
+
+        layout.addStretch()
+
+    def _folder_thumb_width(self) -> int:
+        """Map folder thumbnail scale (1..10) to preview card width in px."""
+        scale = int(self.config.get('folder_thumbnail_scale', 5))
+        return 24 + scale * 6
 
     def _create_sidebar(self) -> QWidget:
         """Create the sidebar with buttons"""
@@ -2126,29 +4415,35 @@ class MainWindow(QMainWindow):
         return sidebar
 
     def _create_gallery(self) -> QWidget:
-        """Create the gallery area with folder bar and thumbnails"""
+        """Create the gallery area with right folder sidebar and thumbnails"""
         container = QFrame()
         container.setObjectName("gallery")
 
-        layout = QVBoxLayout(container)
+        layout = QHBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Folder bar
-        self.folder_bar = QFrame()
-        self.folder_bar.setObjectName("folderBar")
-        self.folder_bar.setFixedHeight(70)
+        gallery_splitter = QSplitter(Qt.Orientation.Horizontal)
+        gallery_splitter.setHandleWidth(10)
+        gallery_splitter.setChildrenCollapsible(False)
+        self.gallery_splitter = gallery_splitter
 
-        self.folder_layout = QHBoxLayout(self.folder_bar)
-        self.folder_layout.setContentsMargins(10, 10, 10, 10)
-        self.folder_layout.setSpacing(8)
+        # Left content: OCR status + gallery grid
+        main_area = QFrame()
+        main_layout = QVBoxLayout(main_area)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        layout.addWidget(self.folder_bar)
+        self.ocr_status_label = QLabel("")
+        self.ocr_status_label.setStyleSheet(
+            f"color: {Theme.TEXT_MUTED}; font-size: 10px; padding: 6px 12px; background: transparent;")
+        self.ocr_status_label.setVisible(False)
+        main_layout.addWidget(self.ocr_status_label)
 
-        # Gallery scroll area
-        self.gallery_scroll = QScrollArea()
+        self.gallery_scroll = QScrollArea() if self._use_minimal_styles else HoverScrollArea()
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.gallery_scroll.setStyleSheet(self._main_scrollbar_stylesheet())
 
         self.gallery_widget = QWidget()
         self.gallery_widget.setStyleSheet(f"background: {Theme.BG_DARK};")
@@ -2158,12 +4453,113 @@ class MainWindow(QMainWindow):
         self.gallery_grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         self.gallery_scroll.setWidget(self.gallery_widget)
-        layout.addWidget(self.gallery_scroll)
+        main_layout.addWidget(self.gallery_scroll)
+        gallery_splitter.addWidget(main_area)
+
+        # Right sidebar: folders
+        self.folder_sidebar = QFrame()
+        self.folder_sidebar.setObjectName("folderSidebar")
+        self.folder_sidebar.setMinimumWidth(190)
+        self.folder_sidebar.setMaximumWidth(520)
+        self.folder_sidebar.setStyleSheet(f"""
+            QFrame#folderSidebar {{
+                background: {Theme.BG_DARK};
+                border-left: 1px solid {Theme.BORDER};
+            }}
+        """)
+
+        sidebar_layout = QVBoxLayout(self.folder_sidebar)
+        sidebar_layout.setContentsMargins(8, 8, 8, 8)
+        sidebar_layout.setSpacing(8)
+
+        title = QLabel("Folders")
+        title.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 10pt; font-weight: 600;")
+        sidebar_layout.addWidget(title)
+
+        self.folder_scroll = QScrollArea() if self._use_minimal_styles else HoverScrollArea()
+        self.folder_scroll.setWidgetResizable(True)
+        self.folder_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.folder_scroll.setStyleSheet(self._main_scrollbar_stylesheet())
+
+        self.folder_widget = QWidget()
+        self.folder_layout = QVBoxLayout(self.folder_widget)
+        self.folder_layout.setContentsMargins(0, 0, 0, 0)
+        self.folder_layout.setSpacing(8)
+
+        self.folder_scroll.setWidget(self.folder_widget)
+        sidebar_layout.addWidget(self.folder_scroll)
+        gallery_splitter.addWidget(self.folder_sidebar)
+        gallery_splitter.setSizes([760, 260])
+        gallery_splitter.setStretchFactor(0, 1)
+        gallery_splitter.setStretchFactor(1, 0)
+
+        layout.addWidget(gallery_splitter)
 
         return container
 
+    def _main_scrollbar_stylesheet(self) -> str:
+        """Dedicated, high-contrast scrollbar style for main window scroll areas."""
+        return """
+            QScrollBar:vertical {
+                background: #1b2d38;
+                width: 16px;
+                margin: 1px;
+                border: 1px solid #0f1e27;
+                border-radius: 8px;
+            }
+            QScrollBar::handle:vertical {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #8ea0aa, stop:0.45 #6f838f, stop:1 #4c5f6a);
+                min-height: 34px;
+                border-radius: 7px;
+                border-top: 1px solid #c8d2d8;
+                border-left: 1px solid #c8d2d8;
+                border-right: 1px solid #2d3d47;
+                border-bottom: 1px solid #2d3d47;
+                margin: 1px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #b2c4ce, stop:0.5 #7fa0b0, stop:1 #4f6a78);
+            }
+            QScrollBar:horizontal {
+                background: #1b2d38;
+                height: 16px;
+                margin: 1px;
+                border: 1px solid #0f1e27;
+                border-radius: 8px;
+            }
+            QScrollBar::handle:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #8ea0aa, stop:0.45 #6f838f, stop:1 #4c5f6a);
+                min-width: 34px;
+                border-radius: 7px;
+                border-top: 1px solid #c8d2d8;
+                border-left: 1px solid #c8d2d8;
+                border-right: 1px solid #2d3d47;
+                border-bottom: 1px solid #2d3d47;
+                margin: 1px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #b2c4ce, stop:0.5 #7fa0b0, stop:1 #4f6a78);
+            }
+            QScrollBar::add-line, QScrollBar::sub-line,
+            QScrollBar::add-page, QScrollBar::sub-page {
+                background: transparent;
+                border: none;
+                width: 0px;
+                height: 0px;
+            }
+        """
+
+    # NOTE: custom frameless edge-resize hooks removed.
+    # Native window frame now provides standard Windows resize cursors and behavior.
+
     def _refresh_folder_bar(self):
-        """Refresh the folder buttons"""
+        """Refresh folder buttons in the right sidebar."""
+        if not hasattr(self, 'folder_layout'):
+            return
         # Clear existing
         while self.folder_layout.count():
             item = self.folder_layout.takeAt(0)
@@ -2171,14 +4567,16 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
 
         # "All" button
-        all_btn = FolderButton(None, self.save_dir, self.current_folder is None)
+        preview_width = self._folder_thumb_width()
+
+        all_btn = FolderButton(None, self.save_dir, self.current_folder is None, preview_width=preview_width)
         all_btn.clicked.connect(self._select_folder)
         self.folder_layout.addWidget(all_btn)
 
         # Folder buttons
         folders = self._get_folders()
         for folder in folders:
-            btn = FolderButton(folder, self.save_dir, self.current_folder == folder)
+            btn = FolderButton(folder, self.save_dir, self.current_folder == folder, preview_width=preview_width)
             btn.clicked.connect(self._select_folder)
             btn.context_menu_requested.connect(self._folder_context_menu)
             btn.file_dropped.connect(self._move_to_folder)
@@ -2186,14 +4584,14 @@ class MainWindow(QMainWindow):
 
         # Add folder button
         add_btn = QPushButton("+")
-        add_btn.setFixedSize(40, 50)
+        add_btn.setFixedSize(200, 56)
         add_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {Theme.BUTTON_BG};
                 color: {Theme.ACCENT};
                 border: 2px dashed {Theme.BUTTON_HOVER};
                 border-radius: 6px;
-                font-size: 20px;
+                font-size: 24px;
                 font-weight: bold;
             }}
             QPushButton:hover {{
@@ -2221,8 +4619,14 @@ class MainWindow(QMainWindow):
         self._refresh_folder_bar()
         self._refresh_gallery()
 
-    def _refresh_gallery(self):
+    def _on_search_changed(self, text: str):
+        self._search_query = text.strip()
+        self._refresh_gallery()
+
+    def _refresh_gallery(self, use_cached_images: bool = False):
         """Refresh the thumbnail gallery"""
+        if not hasattr(self, 'gallery_grid'):
+            return
         # Clear existing
         while self.gallery_grid.count():
             item = self.gallery_grid.takeAt(0)
@@ -2235,20 +4639,38 @@ class MainWindow(QMainWindow):
         else:
             folder_path = self.save_dir
 
-        images = []
-        if folder_path.exists():
-            # Get from folder and subfolders if "All"
-            if self.current_folder is None:
-                for item in folder_path.rglob("*.png"):
-                    if item.is_file():
-                        images.append(item)
-            else:
-                for item in folder_path.glob("*.png"):
-                    if item.is_file():
-                        images.append(item)
+        if use_cached_images and self._last_gallery_images:
+            images = list(self._last_gallery_images)
+        else:
+            images = []
+            if folder_path.exists():
+                if self.current_folder is None:
+                    # Root/main view should show only files in the root save dir,
+                    # not files that were moved into subfolders.
+                    for item in folder_path.glob("*.png"):
+                        if item.is_file():
+                            images.append(item)
+                else:
+                    for item in folder_path.glob("*.png"):
+                        if item.is_file():
+                            images.append(item)
 
-        # Sort by modification time
-        images.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            # Sort by modification time
+            images.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+            # Filter by search query if active
+            if self._search_query and OCR_AVAILABLE:
+                matched = set(str(p) for p in self.ocr_index.search(self._search_query))
+                images = [p for p in images if str(p) in matched]
+                self.ocr_status_label.setText(f'{len(images)} result(s) for "{self._search_query}"')
+                self.ocr_status_label.setVisible(True)
+            elif self._search_query and not OCR_AVAILABLE:
+                self.ocr_status_label.setText("OCR unavailable — Tesseract not found")
+                self.ocr_status_label.setVisible(True)
+            else:
+                self.ocr_status_label.setVisible(False)
+
+            self._last_gallery_images = list(images)
 
         # Calculate thumbnail size
         scale = self.config.get('thumbnail_scale', 5)
@@ -2258,9 +4680,20 @@ class MainWindow(QMainWindow):
         gallery_width = self.gallery_scroll.width() - 50
         cols = max(1, gallery_width // (thumb_size.width() + 20))
 
+        indexed_paths = set()
+        if OCR_AVAILABLE and images:
+            indexed_paths = self.ocr_index.get_indexed_filepaths(images)
+
         # Add thumbnails
         for i, img_path in enumerate(images):
-            thumb = ThumbnailWidget(img_path, thumb_size)
+            indexed = OCR_AVAILABLE and str(img_path) in indexed_paths
+            cached_thumb = self._get_cached_thumbnail(img_path, thumb_size)
+            thumb = ThumbnailWidget(
+                img_path,
+                thumb_size,
+                ocr_indexed=indexed,
+                thumbnail_pixmap=cached_thumb if not cached_thumb.isNull() else None,
+            )
             thumb.clicked.connect(self._on_thumbnail_click)
             thumb.double_clicked.connect(self._open_image)
             thumb.context_menu_requested.connect(self._thumbnail_context_menu)
@@ -2269,22 +4702,98 @@ class MainWindow(QMainWindow):
             col = i % cols
             self.gallery_grid.addWidget(thumb, row, col)
 
-        # Update folder bar
-        self._refresh_folder_bar()
-
         # Update disk usage
         self._update_disk_usage()
+
+    def _current_gallery_columns(self, thumb_size: QSize) -> int:
+        """Calculate how many columns fit in the current gallery viewport."""
+        gallery_width = self.gallery_scroll.width() - 50
+        return max(1, gallery_width // (thumb_size.width() + 20))
+
+    def _thumbnail_cache_key(self, filepath: Path, thumb_size: QSize) -> Optional[str]:
+        """Create a cache key that changes when file content or target thumb size changes."""
+        try:
+            stat = filepath.stat()
+            return f"{filepath}|{stat.st_mtime_ns}|{stat.st_size}|{thumb_size.width()}x{thumb_size.height()}"
+        except Exception:
+            return None
+
+    def _get_cached_thumbnail(self, filepath: Path, thumb_size: QSize) -> QPixmap:
+        """Get a scaled thumbnail pixmap from cache, generating it once when needed."""
+        key = self._thumbnail_cache_key(filepath, thumb_size)
+        if key and key in self._thumb_pixmap_cache:
+            self._thumb_pixmap_cache.move_to_end(key)
+            return self._thumb_pixmap_cache[key]
+
+        source = QPixmap(str(filepath))
+        if source.isNull():
+            return QPixmap()
+
+        scaled = source.scaled(
+            thumb_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+        if key:
+            self._thumb_pixmap_cache[key] = scaled
+            if len(self._thumb_pixmap_cache) > self._thumb_cache_max_entries:
+                self._thumb_pixmap_cache.popitem(last=False)
+
+        return scaled
+
+    def _invalidate_thumbnail_cache(self, filepath: Optional[Path] = None):
+        """Invalidate thumbnail cache entries for one file or clear everything."""
+        if filepath is None:
+            self._thumb_pixmap_cache.clear()
+            return
+
+        prefix = f"{filepath}|"
+        keys = [k for k in self._thumb_pixmap_cache.keys() if k.startswith(prefix)]
+        for key in keys:
+            self._thumb_pixmap_cache.pop(key, None)
+
+    def _remove_thumbnail_from_gallery(self, filepath: Path) -> bool:
+        """Remove one thumbnail widget and reflow existing widgets without rebuilding all thumbnails."""
+        scale = self.config.get('thumbnail_scale', 5)
+        thumb_size = QSize(80 + scale * 15, 60 + scale * 12)
+        cols = self._current_gallery_columns(thumb_size)
+
+        widgets = []
+        removed = False
+
+        while self.gallery_grid.count():
+            item = self.gallery_grid.takeAt(0)
+            widget = item.widget()
+            if not widget:
+                continue
+            if isinstance(widget, ThumbnailWidget) and widget.filepath == filepath:
+                widget.deleteLater()
+                removed = True
+            else:
+                widgets.append(widget)
+
+        for i, widget in enumerate(widgets):
+            row = i // cols
+            col = i % cols
+            self.gallery_grid.addWidget(widget, row, col)
+
+        return removed
 
     def _on_thumbnail_click(self, filepath: Path):
         """Handle single click on thumbnail"""
         self._open_image(filepath)
 
     def _open_image(self, filepath: Path):
-        """Open image in system viewer"""
-        try:
-            os.startfile(str(filepath))
-        except Exception as e:
-            logging.error(f"Failed to open image: {e}")
+        """Open image — in search preview if a query is active, else system viewer."""
+        if self._search_query and OCR_AVAILABLE:
+            dlg = SearchPreviewDialog(filepath, self._search_query, parent=self)
+            dlg.exec()
+        else:
+            try:
+                os.startfile(str(filepath))
+            except Exception as e:
+                logging.error(f"Failed to open image: {e}")
 
     def _thumbnail_context_menu(self, filepath: Path, pos: QPoint):
         """Show context menu for thumbnail"""
@@ -2385,7 +4894,7 @@ class MainWindow(QMainWindow):
                 self._refresh_folder_bar()
                 self._set_status(f"Created folder: {name}")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to create folder: {e}")
+                StyledDialog.warning(self, "Error", f"Failed to create folder: {e}")
 
     def _rename_folder(self, folder_name: str):
         """Rename a folder"""
@@ -2397,28 +4906,26 @@ class MainWindow(QMainWindow):
                 shutil.move(str(old_path), str(new_path))
                 if self.current_folder == folder_name:
                     self.current_folder = new_name
+                self._refresh_folder_bar()
                 self._refresh_gallery()
                 self._set_status(f"Renamed folder to: {new_name}")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to rename folder: {e}")
+                StyledDialog.warning(self, "Error", f"Failed to rename folder: {e}")
 
     def _delete_folder(self, folder_name: str):
         """Delete a folder"""
-        reply = QMessageBox.question(
-            self, "Delete Folder",
-            f"Delete folder '{folder_name}' and all its contents?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        reply = StyledDialog.question(self, "Delete Folder", f"Delete folder '{folder_name}' and all its contents?")
+        if reply:
             folder_path = self.save_dir / folder_name
             try:
                 shutil.rmtree(str(folder_path))
                 if self.current_folder == folder_name:
                     self.current_folder = None
+                self._refresh_folder_bar()
                 self._refresh_gallery()
                 self._set_status(f"Deleted folder: {folder_name}")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to delete folder: {e}")
+                StyledDialog.warning(self, "Error", f"Failed to delete folder: {e}")
 
     def _move_file(self, filepath: Path, target_folder: Optional[str]):
         """Move file to target folder"""
@@ -2428,11 +4935,55 @@ class MainWindow(QMainWindow):
             target = self.save_dir / filepath.name
 
         try:
-            shutil.move(str(filepath), str(target))
+            source = filepath
+
+            # No-op if dropping into the same location.
+            try:
+                if source.resolve() == target.resolve():
+                    self._set_status("Already in selected folder")
+                    return
+            except Exception:
+                pass
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            # Preserve existing target files by using a unique destination name.
+            if target.exists():
+                stem = target.stem
+                suffix = target.suffix
+                i = 1
+                while True:
+                    candidate = target.with_name(f"{stem}_{i}{suffix}")
+                    if not candidate.exists():
+                        target = candidate
+                        break
+                    i += 1
+
+            # Prefer atomic rename/replace on same filesystem; fallback to copy+delete.
+            moved = False
+            try:
+                os.replace(str(source), str(target))
+                moved = True
+            except OSError:
+                shutil.copy2(str(source), str(target))
+                if source.exists():
+                    source.unlink()
+                moved = not source.exists()
+
+            # Final safeguard: if source still exists after "move", remove it.
+            if source.exists() and source != target:
+                source.unlink(missing_ok=True)
+
+            if not moved and source.exists():
+                raise RuntimeError("Move failed: source still exists")
+
+            self._invalidate_thumbnail_cache(filepath)
+            self._invalidate_thumbnail_cache(target)
+            self._refresh_folder_bar()
             self._refresh_gallery()
             self._set_status(f"Moved to: {target_folder or 'root'}")
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to move file: {e}")
+            StyledDialog.warning(self, "Error", f"Failed to move file: {e}")
 
     def _move_to_folder(self, folder_name: Optional[str], source_path: Path):
         """Handle file drop on folder"""
@@ -2440,24 +4991,34 @@ class MainWindow(QMainWindow):
 
     def _delete_image(self, filepath: Path):
         """Delete an image"""
-        reply = QMessageBox.question(
-            self, "Delete Screenshot",
-            f"Delete {filepath.name}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        reply = StyledDialog.question(self, "Delete Screenshot", f"Delete {filepath.name}?")
+        if reply:
             try:
+                file_size = filepath.stat().st_size if filepath.exists() else 0
                 filepath.unlink()
-                self._refresh_gallery()
+                self._invalidate_thumbnail_cache(filepath)
+
+                if OCR_AVAILABLE:
+                    self.ocr_index.remove_file(filepath)
+
+                if not self._remove_thumbnail_from_gallery(filepath):
+                    self._refresh_gallery()
+
+                self._cached_storage_bytes = max(0, (self._cached_storage_bytes or 0) - file_size)
+                self._update_disk_usage()
+
+                # Folder preview strip needs updating, but keep delete interaction snappy.
+                QTimer.singleShot(0, self._refresh_folder_bar)
+
                 self._set_status("Screenshot deleted")
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to delete: {e}")
+                StyledDialog.warning(self, "Error", f"Failed to delete: {e}")
 
     def _edit_image(self, filepath: Path):
         """Open image in editor"""
         pixmap = QPixmap(str(filepath))
         if pixmap.isNull():
-            QMessageBox.warning(self, "Error", "Failed to load image")
+            StyledDialog.warning(self, "Error", "Failed to load image")
             return
 
         self.editor = ScreenshotEditor(pixmap)
@@ -2468,10 +5029,11 @@ class MainWindow(QMainWindow):
         """Save edited image back to file"""
         try:
             pixmap.save(str(filepath), "PNG")
+            self._invalidate_thumbnail_cache(filepath)
             self._refresh_gallery()
             self._set_status("Image saved")
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to save: {e}")
+            StyledDialog.warning(self, "Error", f"Failed to save: {e}")
 
     def _copy_to_clipboard(self, filepath: Path):
         """Copy image to clipboard"""
@@ -2480,7 +5042,7 @@ class MainWindow(QMainWindow):
             self._copy_pil_to_clipboard(img)
             self._set_status("Copied to clipboard")
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to copy: {e}")
+            StyledDialog.warning(self, "Error", f"Failed to copy: {e}")
 
     def _copy_pil_to_clipboard(self, img: Image.Image):
         """Copy PIL image to Windows clipboard"""
@@ -2541,11 +5103,15 @@ class MainWindow(QMainWindow):
 
     def _update_disk_usage(self):
         """Update disk usage display"""
-        total = 0
-        if self.save_dir.exists():
-            for f in self.save_dir.rglob("*"):
-                if f.is_file():
-                    total += f.stat().st_size
+        if self._cached_storage_bytes is None:
+            total = 0
+            if self.save_dir.exists():
+                for f in self.save_dir.rglob("*"):
+                    if f.is_file():
+                        total += f.stat().st_size
+            self._cached_storage_bytes = total
+        else:
+            total = self._cached_storage_bytes
 
         mb = total / (1024 * 1024)
         limit = self.config.get('disk_limit_mb', 500)
@@ -2558,11 +5124,19 @@ class MainWindow(QMainWindow):
     def _register_hotkeys(self):
         """Register global hotkeys"""
         try:
+            keyboard.remove_all_hotkeys()
+        except Exception:
+            pass
+        try:
             keyboard.add_hotkey('ctrl+shift+s', self._hotkey_fullscreen)
             keyboard.add_hotkey('ctrl+shift+r', self._hotkey_region)
             keyboard.add_hotkey('ctrl+shift+w', self._hotkey_window)
         except Exception as e:
             logging.error(f"Failed to register hotkeys: {e}")
+
+    def _register_hotkeys_nonblocking(self):
+        """Register hotkeys without blocking initial UI startup."""
+        threading.Thread(target=self._register_hotkeys, daemon=True).start()
 
     def _hotkey_fullscreen(self):
         """Hotkey callback for fullscreen capture"""
@@ -2657,13 +5231,13 @@ class MainWindow(QMainWindow):
     def _capture_window(self, hwnd: int):
         """Capture specific window"""
         try:
-            # Get window rect
+            # Get window rect - already physical coords in DPI-aware process (PyQt6)
             rect = win32gui.GetWindowRect(hwnd)
             x, y, x2, y2 = rect
             w = x2 - x
             h = y2 - y
 
-            # Capture using mss
+            # Pass physical coords directly to mss (both use physical pixels)
             with mss.mss() as sct:
                 monitor = {"left": x, "top": y, "width": w, "height": h}
                 screenshot = sct.grab(monitor)
@@ -2716,6 +5290,13 @@ class MainWindow(QMainWindow):
 
         # Save to disk
         pixmap.save(str(save_path), "PNG")
+        self._invalidate_thumbnail_cache(save_path)
+
+        # Keep storage usage cache in sync without rescanning entire folder tree.
+        try:
+            self._cached_storage_bytes = (self._cached_storage_bytes or 0) + save_path.stat().st_size
+        except Exception:
+            self._cached_storage_bytes = None
 
         # Update state
         self.session_count += 1
@@ -2730,13 +5311,74 @@ class MainWindow(QMainWindow):
             self.show()
 
         # Defer gallery refresh (non-blocking)
+        QTimer.singleShot(100, self._refresh_folder_bar)
         QTimer.singleShot(100, self._refresh_gallery)
 
-        # Auto-send if enabled
-        if self.config.get('auto_send_enabled', False):
-            target = self.config.get('auto_send_target', '')
-            if target:
-                QTimer.singleShot(500, lambda: self._send_to_target(target))
+        # Fire OCR in background
+        if OCR_AVAILABLE:
+            self._start_ocr(save_path)
+
+        # Auto-send: desktop override (from FloatingBar) takes priority over config
+        target = self._desktop_target_override or (
+            self.config.get('auto_send_target', '')
+            if self.config.get('auto_send_enabled', False) else ''
+        )
+        self._desktop_target_override = None  # consume override
+        if target:
+            QTimer.singleShot(500, lambda t=target: self._send_to_target(t))
+
+    def _inject_desktop_target(self):
+        """
+        Before a floating-bar capture: look at the current virtual desktop,
+        find the topmost visible window that matches a push_target pattern,
+        and temporarily enable auto-send to it.
+        Resets after the next capture completes via _save_screenshot.
+        """
+        if not PYVDA_AVAILABLE:
+            return
+        try:
+            desktop = VirtualDesktop.current()
+            # apps_by_z_order() returns windows top→bottom on current desktop
+            apps = desktop.apps_by_z_order()
+            targets = self.config.get('push_targets', [])
+            for app in apps:
+                try:
+                    title = win32gui.GetWindowText(app.hwnd).lower()
+                except Exception:
+                    continue
+                if not title:
+                    continue
+                # Skip our own windows
+                if 'otterly screenshots' in title:
+                    continue
+                for target in targets:
+                    pattern = target.get('title_pattern', '').lower()
+                    if not pattern:
+                        continue
+                    if any(p.strip() in title for p in pattern.split('|')):
+                        # Found a match — enable auto-send to this target for next capture
+                        self._desktop_target_override = target['name']
+                        logging.info(f"FloatingBar: auto-send override → {target['name']} ({title})")
+                        return
+            # No match found — clear override
+            self._desktop_target_override = None
+        except Exception as e:
+            logging.error(f"_inject_desktop_target failed: {e}")
+            self._desktop_target_override = None
+
+    def _start_ocr(self, filepath: Path):
+        """Start a background OCR worker for a newly saved screenshot."""
+        worker = OcrWorker(filepath, self.ocr_index)
+        worker.finished.connect(self._on_ocr_done)
+        self._ocr_workers.append(worker)
+        worker.start()
+
+    def _on_ocr_done(self, filepath: str, text: str):
+        """Called when OCR finishes — clean up worker ref."""
+        self._ocr_workers = [w for w in self._ocr_workers if w.isRunning()]
+        # If user is actively searching, refresh gallery so new result can appear
+        if self._search_query:
+            self._refresh_gallery()
 
     def _send_to_target(self, target_name: str, filepath: Path = None):
         """Send screenshot to target application"""
@@ -2781,7 +5423,14 @@ class MainWindow(QMainWindow):
 
             # Activate window
             win32gui.SetForegroundWindow(hwnd)
-            QTimer.singleShot(300, lambda: pyautogui.hotkey('ctrl', 'v'))
+
+            def _paste_hotkey():
+                try:
+                    keyboard.press_and_release('ctrl+v')
+                except Exception as e:
+                    logging.error(f"Failed to trigger paste hotkey: {e}")
+
+            QTimer.singleShot(300, _paste_hotkey)
             self._set_status(f"Sent to {target_name}")
         except Exception as e:
             logging.error(f"Failed to send to target: {e}")
@@ -2807,7 +5456,7 @@ class MainWindow(QMainWindow):
 
                 self._process_capture(pixmap)
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to import: {e}")
+                StyledDialog.warning(self, "Error", f"Failed to import: {e}")
 
     def _paste_from_clipboard(self):
         """Paste image from clipboard"""
@@ -2822,18 +5471,30 @@ class MainWindow(QMainWindow):
 
                 self._process_capture(pixmap)
             else:
-                QMessageBox.information(self, "Clipboard", "No image in clipboard")
+                StyledDialog.info(self, "Clipboard", "No image in clipboard")
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to paste: {e}")
+            StyledDialog.warning(self, "Error", f"Failed to paste: {e}")
 
     def _show_settings(self):
         """Show settings dialog"""
         old_theme = self.config.get('theme', 'solarized_dark')
         old_pin = self.config.get('pin_to_all_desktops', False)
+        old_thumb_scale = self.config.get('thumbnail_scale', 5)
+        old_folder_thumb_scale = self.config.get('folder_thumbnail_scale', 5)
+        old_save_dir = Path(self.config.get('save_dir', SAVE_DIR))
         dialog = SettingsDialog(self, self.config)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.config = dialog.get_config()
             self._save_config()
+
+            new_save_dir = Path(self.config.get('save_dir', SAVE_DIR))
+            if new_save_dir != old_save_dir:
+                self.save_dir = new_save_dir
+                self.save_dir.mkdir(parents=True, exist_ok=True)
+                self.ocr_index = OcrIndex(self.save_dir / "ocr_index.db")
+                self._cached_storage_bytes = None
+                self._invalidate_thumbnail_cache()
+                self._last_gallery_images = []
 
             # Check if theme changed
             new_theme = self.config.get('theme', 'solarized_dark')
@@ -2848,7 +5509,25 @@ class MainWindow(QMainWindow):
                 else:
                     self._unpin_from_all_desktops()
 
-            self._refresh_gallery()
+            # Show/hide floating bar per setting
+            if self.config.get('floating_bar_visible', True):
+                self._ensure_floating_bar()
+            else:
+                if self.floating_bar is not None:
+                    self.floating_bar.hide()
+
+            thumb_changed = self.config.get('thumbnail_scale', 5) != old_thumb_scale
+            folder_thumb_changed = self.config.get('folder_thumbnail_scale', 5) != old_folder_thumb_scale
+
+            if folder_thumb_changed or new_save_dir != old_save_dir:
+                self._refresh_folder_bar()
+
+            if thumb_changed:
+                # Rebuild visible thumbnails from cached list to avoid expensive rescan on size-only change.
+                self._refresh_gallery(use_cached_images=True)
+            else:
+                self._refresh_gallery()
+
             self._set_status("Settings saved")
 
     def _apply_theme(self, theme_key: str):
@@ -2856,7 +5535,10 @@ class MainWindow(QMainWindow):
         set_active_theme(theme_key)
 
         # Update main stylesheet
-        self.setStyleSheet(generate_stylesheet())
+        if self._use_minimal_styles:
+            self.setStyleSheet("")
+        else:
+            self.setStyleSheet(generate_stylesheet())
 
         # Update container background
         container = self.centralWidget()
@@ -2873,6 +5555,8 @@ class MainWindow(QMainWindow):
 
     def _rebuild_sidebar(self):
         """Rebuild sidebar with current theme"""
+        if self._use_minimal_styles:
+            return
         # Find the splitter
         splitter = None
         for child in self.centralWidget().children():
@@ -2888,11 +5572,17 @@ class MainWindow(QMainWindow):
 
     def _rebuild_title_bar(self):
         """Rebuild title bar with current theme"""
+        if self._use_minimal_styles:
+            return
         main_layout = self.centralWidget().layout()
         if main_layout and main_layout.count() > 0:
             old_title_bar = main_layout.itemAt(0).widget()
-            if isinstance(old_title_bar, CustomTitleBar):
-                new_title_bar = CustomTitleBar(self)
+            if isinstance(old_title_bar, (CustomTitleBar, SimpleTitleBar)):
+                if self._use_frameless_main_window:
+                    new_title_bar = CustomTitleBar(self, show_window_controls=True)
+                else:
+                    new_title_bar = SimpleTitleBar(self)
+                new_title_bar.search_edit.textChanged.connect(self._on_search_changed)
                 main_layout.replaceWidget(old_title_bar, new_title_bar)
                 self.title_bar = new_title_bar
                 old_title_bar.deleteLater()
@@ -2998,15 +5688,39 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close"""
-        # Unregister hotkeys
+        if self.floating_bar is not None and self.floating_bar.isVisible():
+            result = StyledDialog(
+                self,
+                "Closing Otterly Screenshots",
+                "Keep the floating capture bar running?",
+                sub="You can still capture screenshots from any desktop.\n"
+                    "Reopen the main window anytime by clicking ◎ on the bar.",
+                buttons=[
+                    ("Keep bar running", "primary"),
+                    ("Close everything", "secondary"),
+                ]
+            ).exec()
+
+            if result == "Keep bar running":
+                self.config['floating_bar_visible'] = True
+                self._save_config()
+                try:
+                    keyboard.remove_all_hotkeys()
+                except:
+                    pass
+                event.ignore()
+                self.hide()
+                return
+
+        # Full quit — unregister hotkeys, close bar too
         try:
             keyboard.remove_all_hotkeys()
         except:
             pass
+        if self.floating_bar is not None:
+            self.floating_bar.close()
 
-        # Save config
         self._save_config()
-
         event.accept()
 
 
@@ -3015,13 +5729,9 @@ class MainWindow(QMainWindow):
 # ============================================================================
 
 def main():
-    # High DPI support
-    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
-
+    _trace_startup("main start")
     app = QApplication(sys.argv)
+    _trace_startup("QApplication created")
     app.setApplicationName(APP_NAME)
 
     # Set app icon
@@ -3030,10 +5740,26 @@ def main():
         app.setWindowIcon(QIcon(str(logo_path)))
 
     try:
+        print("[Otterly] Creating main window...", flush=True)
         window = MainWindow()
+        _trace_startup("MainWindow instance created")
+        print("[Otterly] Showing main window...", flush=True)
+        _trace_startup("About to call MainWindow.show")
         window.show()
+        _trace_startup("MainWindow show called")
+        print("[Otterly] Main window shown. Scheduling floating bar...", flush=True)
+        QTimer.singleShot(600, window._ensure_floating_bar)
+        QTimer.singleShot(1200, window._register_hotkeys_nonblocking)
+        _trace_startup("Delayed hotkey registration scheduled")
+        # Ensure the main window is brought to the foreground on startup.
+        QTimer.singleShot(300, window.showNormal)
+        QTimer.singleShot(350, window.raise_)
+        QTimer.singleShot(400, window.activateWindow)
+        print("[Otterly] Entering event loop. App is running.", flush=True)
+        _trace_startup("Entering app.exec")
         sys.exit(app.exec())
     except Exception as e:
+        _trace_startup(f"main exception: {e}")
         logging.error(f"Application error: {e}\n{traceback.format_exc()}")
         raise
 
