@@ -168,3 +168,6 @@ Current: v2.0
 - VBS visible fallback command now wraps full interpreter/script payload with nested quotes (`cmd /k ""..." "...""`) so paths under `G:\My Drive\...` are parsed correctly.
 - `install.py` launcher template updated to generate the same robust quoted fallback behavior for future installs.
 - Main window uses native OS window frame resizing for standard edge hover cursors and drag behavior (stability-first fallback from custom frameless resize hooks).
+- 2026-03-10: Sidebar cleanup in `screenshot_tool_pyqt.py` removes bottom clutter from the right menu (Storage/Screenshots/About hidden) and keeps uniform button spacing.
+- Thumbnail right-click menu now has two explicit open actions: `Open Image` and `Open OCR Text`.
+- Added `OcrIndex.get_text(filepath)` and `_open_ocr_text(filepath)`; OCR text opens in the system text editor from a temp `.txt` file, with a friendly message when OCR text is not available yet.

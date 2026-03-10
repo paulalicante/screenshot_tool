@@ -505,6 +505,12 @@ class OcrIndex:
             rows = con.execute(sql, params).fetchall()
         return [Path(r[0]) for r in rows]
 
+    def get_text(self, filepath: Path) -> str | None:
+        """Return OCR text for a file, or None if not indexed."""
+        with self._connect() as con:
+            row = con.execute("SELECT text FROM ocr WHERE filepath=?", (str(filepath),)).fetchone()
+            return row[0] if row else None
+
     def remove_file(self, filepath: Path):
         with self._connect() as con:
             con.execute("DELETE FROM ocr WHERE filepath=?", (str(filepath),))
@@ -4363,8 +4369,6 @@ class MainWindow(QMainWindow):
         window_btn.clicked.connect(self._start_window_capture)
         layout.addWidget(window_btn)
 
-        layout.addSpacing(15)
-
         # Import buttons
         import_btn = QPushButton("📁 Import from File")
         import_btn.setStyleSheet(btn_style)
@@ -4376,41 +4380,19 @@ class MainWindow(QMainWindow):
         paste_btn.clicked.connect(self._paste_from_clipboard)
         layout.addWidget(paste_btn)
 
-        layout.addStretch()
-
         # Settings button
         settings_btn = QPushButton("⚙️ Settings")
         settings_btn.setStyleSheet(btn_style)
         settings_btn.clicked.connect(self._show_settings)
         layout.addWidget(settings_btn)
 
-        # Disk usage
-        self.disk_label = QLabel("Calculating...")
-        self.disk_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 9pt;")
-        layout.addWidget(self.disk_label)
+        layout.addStretch()
 
-        # Session counter
-        self.session_label = QLabel("Screenshots: 0")
-        self.session_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 9pt;")
-        layout.addWidget(self.session_label)
-
-        # About button
-        about_btn = QPushButton("About")
-        about_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {Theme.TEXT_MUTED};
-                border: none;
-                text-align: left;
-                padding: 5px;
-                font-size: 9pt;
-            }}
-            QPushButton:hover {{
-                color: {Theme.TEXT_LIGHT};
-            }}
-        """)
-        about_btn.clicked.connect(self._show_about)
-        layout.addWidget(about_btn)
+        # Hidden labels kept for internal tracking (not shown in sidebar)
+        self.disk_label = QLabel()
+        self.disk_label.hide()
+        self.session_label = QLabel()
+        self.session_label.hide()
 
         return sidebar
 
@@ -4795,6 +4777,21 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logging.error(f"Failed to open image: {e}")
 
+    def _open_ocr_text(self, filepath: Path):
+        """Retrieve OCR text for the image and open it in the default text editor."""
+        text = self.ocr_index.get_text(filepath)
+        if not text:
+            QMessageBox.information(self, "OCR Text", "No OCR text available for this image.\nIt may not have been indexed yet.")
+            return
+        # Write to a temp .txt file and open with system text editor
+        import tempfile
+        txt_path = Path(tempfile.gettempdir()) / f"{filepath.stem}_ocr.txt"
+        txt_path.write_text(text, encoding="utf-8")
+        try:
+            os.startfile(str(txt_path))
+        except Exception as e:
+            logging.error(f"Failed to open OCR text: {e}")
+
     def _thumbnail_context_menu(self, filepath: Path, pos: QPoint):
         """Show context menu for thumbnail"""
         menu = QMenu(self)
@@ -4815,8 +4812,12 @@ class MainWindow(QMainWindow):
             }}
         """)
 
-        open_action = menu.addAction("Open")
+        open_action = menu.addAction("Open Image")
         open_action.triggered.connect(lambda: self._open_image(filepath))
+
+        if OCR_AVAILABLE:
+            ocr_action = menu.addAction("Open OCR Text")
+            ocr_action.triggered.connect(lambda: self._open_ocr_text(filepath))
 
         edit_action = menu.addAction("Edit")
         edit_action.triggered.connect(lambda: self._edit_image(filepath))
