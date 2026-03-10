@@ -77,7 +77,7 @@ try:
         QToolButton, QDialogButtonBox, QWidgetAction, QSizeGrip
     )
     from PyQt6.QtCore import (
-        Qt, QPoint, QTimer, QSize, QRect, QThread, pyqtSignal,
+        Qt, QPoint, QTimer, QSize, QRect, QRectF, QThread, pyqtSignal,
         QMimeData, QUrl, QPropertyAnimation, QEasingCurve
     )
     from PyQt6.QtGui import (
@@ -99,7 +99,7 @@ except ImportError:
             QToolButton, QDialogButtonBox, QWidgetAction, QSizeGrip
         )
         from PyQt6.QtCore import (
-            Qt, QPoint, QTimer, QSize, QRect, QThread, pyqtSignal,
+            Qt, QPoint, QTimer, QSize, QRect, QRectF, QThread, pyqtSignal,
             QMimeData, QUrl, QPropertyAnimation, QEasingCurve
         )
         from PyQt6.QtGui import (
@@ -1224,15 +1224,22 @@ class CustomTitleBar(QWidget):
         self.search_edit.setFixedHeight(24)
         self.search_edit.setStyleSheet(f"""
             QLineEdit {{
-                background: {Theme.BG_DARKER};
-                color: {Theme.TEXT_TITLEBAR};
-                border: 1px solid {Theme.TEXT_MUTED};
+                background: {Theme.BG_LIGHT};
+                color: {Theme.TEXT_DARK};
+                border: 1px solid {Theme.BORDER};
                 border-radius: 4px;
                 padding: 1px 24px 1px 8px;
                 font-size: 11px;
             }}
+            QLineEdit::placeholder {{
+                color: {Theme.TEXT_MUTED};
+            }}
             QLineEdit:focus {{
-                border-color: #2AA198;
+                border-color: {Theme.ACCENT};
+            }}
+            QLineEdit:selected {{
+                background: {Theme.ACCENT};
+                color: white;
             }}
         """)
 
@@ -1367,6 +1374,22 @@ class SimpleTitleBar(QWidget):
         self.search_edit.setPlaceholderText("Text Search")
         self.search_edit.setFixedWidth(240)
         self.search_edit.setFixedHeight(24)
+        self.search_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {Theme.BG_LIGHT};
+                color: {Theme.TEXT_DARK};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 4px;
+                padding: 1px 8px;
+                font-size: 11px;
+            }}
+            QLineEdit::placeholder {{
+                color: {Theme.TEXT_MUTED};
+            }}
+            QLineEdit:focus {{
+                border-color: {Theme.ACCENT};
+            }}
+        """)
         layout.addWidget(self.search_edit)
 
 
@@ -1988,8 +2011,131 @@ class FolderHoverPreview(QFrame):
 # FOLDER BUTTON
 # ============================================================================
 
+class FolderPreviewWidget(QWidget):
+    """Painted folder thumbnail where the folder graphic is the whole list item."""
+
+    def __init__(self, images: List[Path], preview_width: int, preview_height: int,
+                 folder_label: str, selected: bool = False):
+        super().__init__()
+        self.images = images
+        self.folder_label = folder_label
+        self.selected = selected
+        self.preview_thumb_width = max(18, int(preview_width))
+        self.preview_thumb_height = max(24, int(preview_height))
+        self._source_pixmaps: List[QPixmap] = []
+
+        # Keep up to three most-recent screenshots for miniature strip rendering.
+        for img_path in self.images[:3]:
+            pixmap = QPixmap(str(img_path))
+            if not pixmap.isNull():
+                self._source_pixmaps.append(pixmap)
+
+        # Fill the full folder-card preview area instead of a small centered icon.
+        self.setMinimumWidth(max(110, self.preview_thumb_width * 3 + 12))
+        self.setFixedHeight(max(112, self.preview_thumb_height + 34))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_selected(self, selected: bool):
+        self.selected = selected
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Classic folder silhouette: back body + front pocket with angled left edge.
+        outline = QColor(28, 70, 112) if self.selected else QColor(32, 79, 126)
+        back_fill = QColor(238, 201, 142)
+        front_fill = QColor(232, 201, 146)
+
+        pad = 3.0
+        body = QRectF(pad + 5, pad + 8, self.width() - (pad * 2) - 8, self.height() - (pad * 2) - 12)
+        tab = QRectF(body.left() + 3, body.top() - 9, body.width() * 0.33, 13)
+
+        painter.setPen(QPen(outline, 2))
+        painter.setBrush(QBrush(back_fill))
+        painter.drawRoundedRect(body, 10, 10)
+        painter.drawRoundedRect(tab, 7, 7)
+
+        painter.setPen(QColor(25, 56, 90))
+        tab_font = painter.font()
+        tab_font.setPointSize(8)
+        tab_font.setBold(True)
+        painter.setFont(tab_font)
+        painter.drawText(tab.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignCenter, self.folder_label)
+
+        front = QPainterPath()
+        fx = pad
+        fy = body.top() + 6
+        fw = self.width() - (pad * 2) - 2
+        fh = self.height() - fy - pad - 2
+        front.moveTo(fx + 16, fy)
+        front.lineTo(fx + fw - 12, fy)
+        front.quadTo(fx + fw, fy, fx + fw - 2, fy + 10)
+        front.lineTo(fx + fw - 8, fy + fh - 2)
+        front.quadTo(fx + fw - 10, fy + fh + 2, fx + fw - 16, fy + fh + 2)
+        front.lineTo(fx + 12, fy + fh + 2)
+        front.quadTo(fx + 1, fy + fh + 2, fx + 1, fy + fh - 8)
+        front.lineTo(fx + 6, fy + 14)
+        front.quadTo(fx + 7, fy + 5, fx + 16, fy)
+        front.closeSubpath()
+
+        painter.setPen(QPen(outline, 2))
+        painter.setBrush(QBrush(front_fill))
+        painter.drawPath(front)
+
+        # The preview image should read as part of the folder surface, not as
+        # a separate inner "thumbnail widget".
+        image_rect = QRectF(fx + 13, fy + 7, fw - 26, fh - 12)
+
+        if self._source_pixmaps:
+            slot_count = 3
+            # Overlapping mini-previews for a stacked-paper look.
+            step_factor = 0.58
+            slot_w = max(1.0, image_rect.width() / (1 + (slot_count - 1) * step_factor))
+            slot_step = slot_w * step_factor
+            slot_h = max(1.0, image_rect.height() - 4.0)
+            y_offsets = (0.0, 2.0, 4.0)
+
+            # Most recent image is first in self.images, so render left-to-right.
+            for i in range(slot_count):
+                slot_rect = QRectF(
+                    image_rect.left() + (i * slot_step),
+                    image_rect.top() + y_offsets[i],
+                    slot_w,
+                    slot_h,
+                )
+                if i < len(self._source_pixmaps):
+                    preview = FolderButton._scaled_cropped(
+                        self._source_pixmaps[i],
+                        max(1, int(slot_rect.width())),
+                        max(1, int(slot_rect.height())),
+                    )
+                    clip = QPainterPath()
+                    clip.addRoundedRect(QRectF(slot_rect.adjusted(0.5, 0.5, -0.5, -0.5)), 4, 4)
+                    painter.save()
+                    painter.setClipPath(clip)
+                    painter.drawPixmap(slot_rect.toRect(), preview)
+                    painter.restore()
+                    painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRoundedRect(slot_rect.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4)
+                else:
+                    painter.setPen(QPen(QColor(196, 168, 121), 1))
+                    painter.setBrush(QBrush(QColor(227, 195, 140)))
+                    painter.drawRoundedRect(slot_rect, 4, 4)
+
+            # Subtle tint so minis still read as part of a folder surface.
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(232, 201, 146, 32)))
+            painter.drawRoundedRect(image_rect, 6, 6)
+        else:
+            painter.setPen(QColor(Theme.TEXT_MUTED))
+            painter.drawText(image_rect, Qt.AlignmentFlag.AlignCenter, "No preview")
+
+
 class FolderButton(QFrame):
-    """Folder button with preview thumbnails"""
+    """Folder button with folder-style preview cards"""
 
     clicked = pyqtSignal(object)  # folder name or None
     context_menu_requested = pyqtSignal(object, QPoint)
@@ -2002,7 +2148,8 @@ class FolderButton(QFrame):
         self.base_dir = base_dir
         self.selected = selected
         self.preview_thumb_width = max(18, int(preview_width))
-        self.preview_thumb_height = self.preview_thumb_width * 2
+        # Make folder cards visibly taller so miniature screenshot strips have room.
+        self.preview_thumb_height = max(68, int(self.preview_thumb_width * 2.1))
         self._preview_images: List[Path] = []
         self._hover_preview: Optional[FolderHoverPreview] = None
 
@@ -2014,13 +2161,10 @@ class FolderButton(QFrame):
         self._update_style()
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Preview thumbnails row
-        preview_layout = QHBoxLayout()
-        preview_layout.setSpacing(2)
-
+        # Build recent image list for preview + hover panel
         folder_path = base_dir / folder_name if folder_name else base_dir
         if folder_path.exists():
             images = sorted(
@@ -2030,54 +2174,20 @@ class FolderButton(QFrame):
             )[:3]
             self._preview_images = images
 
-            for img_path in images:
-                thumb = QLabel()
-                pixmap = QPixmap(str(img_path))
-                if not pixmap.isNull():
-                    scaled = self._scaled_cropped(
-                        pixmap,
-                        self.preview_thumb_width,
-                        self.preview_thumb_height,
-                    )
-                    thumb.setPixmap(scaled)
-                    thumb.setFixedSize(self.preview_thumb_width, self.preview_thumb_height)
-                    thumb.setStyleSheet("background: transparent;")
-                    preview_layout.addWidget(thumb)
-
-        preview_layout.addStretch()
-        layout.addLayout(preview_layout)
-
-        # Folder name
-        name_label = QLabel(folder_name or "All")
-        name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        name_label.setStyleSheet(f"""
-            color: {Theme.BUTTON_TEXT};
-            font-size: 10pt;
-            font-weight: 600;
-            background: transparent;
-        """)
-        layout.addWidget(name_label)
+        self.preview_widget = FolderPreviewWidget(
+            self._preview_images,
+            self.preview_thumb_width,
+            self.preview_thumb_height,
+            folder_name or "Main",
+            selected=self.selected,
+        )
+        layout.addWidget(self.preview_widget)
 
     def _update_style(self):
-        if self.selected:
-            self.setStyleSheet(f"""
-                QFrame {{
-                    background: {Theme.ACCENT};
-                    border-radius: 6px;
-                }}
-            """)
-        else:
-            self.setStyleSheet(f"""
-                QFrame {{
-                    background: {Theme.BUTTON_BG};
-                    border: 1px solid {Theme.BUTTON_HOVER};
-                    border-radius: 6px;
-                }}
-                QFrame:hover {{
-                    background: {Theme.BUTTON_HOVER};
-                    border-color: {Theme.ACCENT};
-                }}
-            """)
+        # No outer card framing: the folder artwork itself is the full item.
+        self.setStyleSheet("QFrame { background: transparent; border: none; }")
+        if hasattr(self, 'preview_widget'):
+            self.preview_widget.set_selected(self.selected)
 
     def set_selected(self, selected: bool):
         self.selected = selected
@@ -2087,17 +2197,11 @@ class FolderButton(QFrame):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self.folder_name)
         elif event.button() == Qt.MouseButton.RightButton:
-            if self.folder_name:  # Don't show context menu for "All"
+            if self.folder_name:  # Don't show context menu for "Main"
                 self.context_menu_requested.emit(self.folder_name, event.globalPosition().toPoint())
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            self.setStyleSheet(f"""
-                QFrame {{
-                    background: {Theme.SUCCESS};
-                    border-radius: 6px;
-                }}
-            """)
             event.acceptProposedAction()
 
     def enterEvent(self, event):
@@ -4016,6 +4120,8 @@ class MainWindow(QMainWindow):
         self.current_folder: Optional[str] = None
         self.capture_in_progress = False
         self.session_count = 0
+        self._main_was_visible_before_capture = False
+        self._floating_bar_was_visible_before_capture = False
         self._cached_storage_bytes: Optional[int] = None
         self._thumb_pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
         self._thumb_cache_max_entries = 500
@@ -4420,6 +4526,28 @@ class MainWindow(QMainWindow):
         self.ocr_status_label.setStyleSheet(
             f"color: {Theme.TEXT_MUTED}; font-size: 10px; padding: 6px 12px; background: transparent;")
         self.ocr_status_label.setVisible(False)
+
+        self.current_folder_label = QLabel("Main")
+        self.current_folder_label.setStyleSheet("""
+            color: rgb(25, 56, 90);
+            background: rgb(238, 201, 142);
+            border: 1px solid rgb(32, 79, 126);
+            border-radius: 7px;
+            font-size: 9pt;
+            font-weight: 700;
+            padding: 3px 10px;
+            margin: 6px 0 2px 10px;
+        """)
+        self.current_folder_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.current_folder_label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self._update_current_folder_label()
+
+        folder_title_row = QHBoxLayout()
+        folder_title_row.setContentsMargins(0, 0, 0, 0)
+        folder_title_row.setSpacing(0)
+        folder_title_row.addWidget(self.current_folder_label)
+        folder_title_row.addStretch()
+        main_layout.addLayout(folder_title_row)
         main_layout.addWidget(self.ocr_status_label)
 
         self.gallery_scroll = QScrollArea() if self._use_minimal_styles else HoverScrollArea()
@@ -4454,10 +4582,6 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(8, 8, 8, 8)
         sidebar_layout.setSpacing(8)
 
-        title = QLabel("Folders")
-        title.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 10pt; font-weight: 600;")
-        sidebar_layout.addWidget(title)
-
         self.folder_scroll = QScrollArea() if self._use_minimal_styles else HoverScrollArea()
         self.folder_scroll.setWidgetResizable(True)
         self.folder_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -4466,7 +4590,7 @@ class MainWindow(QMainWindow):
         self.folder_widget = QWidget()
         self.folder_layout = QVBoxLayout(self.folder_widget)
         self.folder_layout.setContentsMargins(0, 0, 0, 0)
-        self.folder_layout.setSpacing(8)
+        self.folder_layout.setSpacing(2)
 
         self.folder_scroll.setWidget(self.folder_widget)
         sidebar_layout.addWidget(self.folder_scroll)
@@ -4548,7 +4672,7 @@ class MainWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
 
-        # "All" button
+        # "Main" button
         preview_width = self._folder_thumb_width()
 
         all_btn = FolderButton(None, self.save_dir, self.current_folder is None, preview_width=preview_width)
@@ -4598,8 +4722,15 @@ class MainWindow(QMainWindow):
     def _select_folder(self, folder_name: Optional[str]):
         """Select a folder to filter gallery"""
         self.current_folder = folder_name
+        self._update_current_folder_label()
         self._refresh_folder_bar()
         self._refresh_gallery()
+
+    def _update_current_folder_label(self):
+        """Keep the current-folder badge in sync with gallery filter state."""
+        if not hasattr(self, 'current_folder_label'):
+            return
+        self.current_folder_label.setText(self.current_folder or "Main")
 
     def _on_search_changed(self, text: str):
         self._search_query = text.strip()
@@ -4907,6 +5038,7 @@ class MainWindow(QMainWindow):
                 shutil.move(str(old_path), str(new_path))
                 if self.current_folder == folder_name:
                     self.current_folder = new_name
+                    self._update_current_folder_label()
                 self._refresh_folder_bar()
                 self._refresh_gallery()
                 self._set_status(f"Renamed folder to: {new_name}")
@@ -4922,6 +5054,7 @@ class MainWindow(QMainWindow):
                 shutil.rmtree(str(folder_path))
                 if self.current_folder == folder_name:
                     self.current_folder = None
+                    self._update_current_folder_label()
                 self._refresh_folder_bar()
                 self._refresh_gallery()
                 self._set_status(f"Deleted folder: {folder_name}")
@@ -5164,13 +5297,14 @@ class MainWindow(QMainWindow):
             self.countdown.countdown_cancelled.connect(self._capture_cancelled)
             self.countdown.show()
         else:
-            # Small delay to let window hide
-            if not self.config.get('silent_capture', False):
-                self.hide()
             QTimer.singleShot(50, self._do_region_capture)
 
     def _do_region_capture(self):
         """Execute region capture"""
+        self._prepare_capture_ui()
+        QTimer.singleShot(240, self._show_region_selector)
+
+    def _show_region_selector(self):
         self.region_selector = RegionSelector()
         self.region_selector.region_selected.connect(self._on_region_captured)
         self.region_selector.cancelled.connect(self._capture_cancelled)
@@ -5193,12 +5327,15 @@ class MainWindow(QMainWindow):
             self.countdown.countdown_cancelled.connect(self._capture_cancelled)
             self.countdown.show()
         else:
-            if not self.config.get('silent_capture', False):
-                self.hide()
             QTimer.singleShot(50, self._do_fullscreen_capture)
 
     def _do_fullscreen_capture(self):
         """Execute fullscreen capture"""
+        self._prepare_capture_ui()
+        QTimer.singleShot(240, self._capture_fullscreen_after_hide)
+
+    def _capture_fullscreen_after_hide(self):
+        """Capture full screen once app windows are fully hidden."""
         with mss.mss() as sct:
             monitor = sct.monitors[0]
             screenshot = sct.grab(monitor)
@@ -5217,17 +5354,64 @@ class MainWindow(QMainWindow):
             return
         self.capture_in_progress = True
 
-        if not self.config.get('silent_capture', False):
-            self.hide()
-
         QTimer.singleShot(50, self._do_window_capture)
 
     def _do_window_capture(self):
         """Execute window capture selection"""
+        self._prepare_capture_ui()
         self.window_selector = WindowSelector()
         self.window_selector.window_selected.connect(self._capture_window)
         self.window_selector.cancelled.connect(self._capture_cancelled)
         self.window_selector.show()
+
+    def _prepare_capture_ui(self):
+        """Hide app windows before any capture so they never bleed into screenshots."""
+        self._main_was_visible_before_capture = self.isVisible()
+        self._floating_bar_was_visible_before_capture = bool(
+            self.floating_bar and self.floating_bar.isVisible()
+        )
+
+        if self._floating_bar_was_visible_before_capture:
+            self.floating_bar.hide()
+        if self.isVisible():
+            self.hide()
+
+        # Safety: hide any stray top-level Otterly windows that might still be shown.
+        for w in QApplication.topLevelWidgets():
+            if not w.isVisible():
+                continue
+            try:
+                title = (w.windowTitle() or "").lower()
+            except Exception:
+                title = ""
+            if w is self or w is self.floating_bar or "otterly" in title:
+                try:
+                    w.hide()
+                except Exception:
+                    pass
+
+        QApplication.processEvents()
+        # Let Windows compositor commit hidden-state changes before capture.
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.dwmapi.DwmFlush()
+            except Exception:
+                pass
+
+    def _restore_capture_ui(self):
+        """Restore app windows after a capture flow finishes or is cancelled."""
+        if not self.config.get('silent_capture', False):
+            self.show()
+
+        if (
+            self.config.get('floating_bar_visible', True)
+            and self.floating_bar
+            and self._floating_bar_was_visible_before_capture
+        ):
+            QTimer.singleShot(120, self.floating_bar.show)
+
+        self._main_was_visible_before_capture = False
+        self._floating_bar_was_visible_before_capture = False
 
     def _capture_window(self, hwnd: int):
         """Capture specific window"""
@@ -5257,8 +5441,7 @@ class MainWindow(QMainWindow):
     def _capture_cancelled(self):
         """Handle capture cancellation"""
         self.capture_in_progress = False
-        if not self.config.get('silent_capture', False):
-            self.show()
+        self._restore_capture_ui()
         self._set_status("Capture cancelled")
 
     def _process_capture(self, pixmap: QPixmap):
@@ -5308,8 +5491,7 @@ class MainWindow(QMainWindow):
         self._set_status(f"Saved: {filename}")
 
         # Show window if not silent
-        if not self.config.get('silent_capture', False):
-            self.show()
+        self._restore_capture_ui()
 
         # Defer gallery refresh (non-blocking)
         QTimer.singleShot(100, self._refresh_folder_bar)

@@ -87,6 +87,21 @@ Place `logo.png` in the app directory to display:
 - In the About dialog
 - As the window/taskbar icon
 
+## Microsoft Store Publishing
+
+**NEW:** MSIX packaging infrastructure created for publishing to Microsoft Store!
+
+See: `msix/TASK_CREATE_MSIX_PACKAGE.md` for Copilot implementation task  
+Guide: `msix/MSIX_PUBLISHING_GUIDE.md` for complete publishing workflow
+
+**Files to be created by Copilot:**
+- `msix/AppxManifest.xml` — Package manifest
+- `msix/build_msix.ps1` — Build script
+- `msix/setup_msix.py` — Asset generator
+- `msix/Assets/` — Store images (7 PNG files)
+
+**Output:** `msix/OtterlyScreenshots_1.0.0.0_x64.msix` ready for Microsoft Store
+
 ## Building & Distribution
 
 ### Build standalone .exe (for sharing)
@@ -171,3 +186,18 @@ Current: v2.0
 - 2026-03-10: Sidebar cleanup in `screenshot_tool_pyqt.py` removes bottom clutter from the right menu (Storage/Screenshots/About hidden) and keeps uniform button spacing.
 - Thumbnail right-click menu now has two explicit open actions: `Open Image` and `Open OCR Text`.
 - Added `OcrIndex.get_text(filepath)` and `_open_ocr_text(filepath)`; OCR text opens in the system text editor from a temp `.txt` file, with a friendly message when OCR text is not available yet.
+- Right sidebar folder cards now render a folder-like preview shell; latest image preview appears inside the folder body for a clearer "actual folder" visual.
+- Fixed runtime crash in folder preview paint path: `QPainterPath.addRoundedRect(...)` now uses `QRectF` (PyQt6 overload requirement) instead of `QRect`.
+- Folder card artwork was restyled to a more classic folder silhouette (back tab + front pocket with angled edge) to avoid phone-like appearance.
+- Folder icon preview now expands to fill the full folder-card preview area (instead of rendering as a small centered icon).
+- Folder preview now renders as part of the folder surface itself (no separate inner thumbnail frame), and card proportions were adjusted away from tall phone-like aspect.
+- Folder list items now remove outer card framing entirely (transparent container) so each row is just the folder graphic; folder names are rendered directly on the folder tab.
+- Root sidebar folder label was renamed from `All` to `Main` for clearer naming in the folder list UI.
+- Removed the top `Folders` header label from the sidebar so folder rows start immediately at the top.
+- Folder sidebar cards are now ~2x taller and render a 3-miniature screenshot strip from folder contents (newest image on the left).
+- Folder miniature strip now uses an overlapping "stacked-paper" layout (still newest on the left) for a stronger folder-preview look.
+- Title-bar search input styling now forces high-contrast text/placeholder/border colors for better readability across themes.
+- Main gallery now shows a current-folder badge (`Main` or selected folder name) above thumbnails, styled to match the folder-tab label look.
+- Capture flow now hard-hides both main window and floating bar before region/window/screen capture and restores UI afterward, preventing Otterly windows from appearing during selection.
+- Capture pre-hide now also forces Otterly windows to temporary 0-opacity before hide and uses a slightly longer pre-capture settle delay to avoid transparent DWM ghosting in region overlays.
+- Reworked capture pre-hide to avoid opacity transitions (which could leave translucent ghosts): now uses strict hide + `DwmFlush()` + longer settle delay before region/fullscreen capture.
