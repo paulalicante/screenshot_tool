@@ -144,6 +144,32 @@ Removes shortcuts and startup entry (keeps app files).
 ## Version
 Current: v2.0
 
+## Performance (2026-10-30) — read before touching the gallery
+Paul: "it is SLOW". Measured on his 912 root screenshots (offscreen harness, same code paths):
+- **Every gallery refresh froze the app ~27 s** (startup ~55 s: two refreshes). Cause: the in-memory
+  thumbnail LRU held 500 entries; walking 912 files in the same order every refresh means an LRU never
+  hits, so every refresh decoded every full-size PNG again. Refreshes ran after every capture, every
+  search keystroke, every window-resize event, folder switch, move and edit.
+- Now: thumbnails come from a **disk cache** (`%LOCALAPPDATA%\OtterlyScreenshots\thumbs`, max 640x480,
+  JPEG unless the image has alpha, key = path + mtime + size; outside the save folder so OCR re-index,
+  storage totals and folder lists never see it; ~42 MB for 912) made by a background `ThumbnailLoader`
+  QThread (QImage only; stopped on `aboutToQuit`). Tiles are kept in `_thumb_widgets` and only re-ordered
+  on refresh; new tiles are created 80 per event-loop turn (`_create_missing_thumbnails`); the grid
+  position is by index, so use `_gallery_order` (not grid insertion order) to re-flow. Theme, folder or
+  thumbnail size change rebuilds the tiles (`_gallery_context`). Resize only re-flows (`_reflow_gallery`,
+  debounced 120 ms); search is debounced 250 ms; directory listings use `os.scandir`.
+- Results: refresh after a capture 27 s -> 0.04 s; search 6.5 s -> 0.03 s; startup until every thumbnail
+  is shown ~4 s warm with the window usable throughout (longest stall ~0.4 s; first run ever builds the
+  cache in the background, ~37 s). Folder bar 0.25 -> 0.1 s; hover preview decodes from the cache.
+- Capture path: the PNG is written on a background thread (a full 3440x1440 screen took 0.9 s on the UI
+  thread); gallery/folder/OCR follow in `_on_screenshot_written`. Two captures in one second get `_1`,
+  `_2` names instead of overwriting. Screen grabs go BGRA -> QImage directly (`grab_to_pixmap`, no PIL);
+  clipboard DIB built with one `mirrored()` instead of a Python row loop (64 -> 16 ms). Byte-identical.
+- Still slow on purpose: the capture hide/settle delays (50 + 240 ms) that prevent ghosting.
+- `screenshot_20260616_165903.png` (3.6 MB) is corrupt (libpng "invalid block type"); it shows no picture.
+- Proof scripts (scratchpad, not in repo): harness2.py (timings), functest.py (29 checks on a scratch copy).
+- Backup of the file before this change: `screenshot_tool_pyqt.py.bak_pre_speedup_2026_10_30`.
+
 ## Recent Updates
 - 2026-03-08: Improved gallery responsiveness for delete/save flows in `screenshot_tool_pyqt.py`.
 - Delete now removes thumbnail widgets incrementally (no full gallery rebuild for a single delete).
@@ -201,3 +227,10 @@ Current: v2.0
 - Capture flow now hard-hides both main window and floating bar before region/window/screen capture and restores UI afterward, preventing Otterly windows from appearing during selection.
 - Capture pre-hide now also forces Otterly windows to temporary 0-opacity before hide and uses a slightly longer pre-capture settle delay to avoid transparent DWM ghosting in region overlays.
 - Reworked capture pre-hide to avoid opacity transitions (which could leave translucent ghosts): now uses strict hide + `DwmFlush()` + longer settle delay before region/fullscreen capture.
+- Main content splitters now use thin 3D divider styling; left sidebar divider is fixed/non-resizable, while the gallery/folder divider remains resizable.
+- Gallery/folder splitter resize now uses non-opaque dragging for smoother interaction on heavy thumbnail scenes.
+- Gallery and folder scroll areas now offset viewport margins so hover scrollbars visually overlap divider edges instead of sitting beside them.
+- Divider and scrollbar visual tuning in `screenshot_tool_pyqt.py`:
+  - Left divider now uses a custom `ThreeDLine` widget with a 3D effect matching the background color (not resizable, visually distinct).
+  - Gallery scrollbar is offset 10px to the right for improved visual separation from the divider.
+  - Default splitter handle styling removed for left divider; right divider remains resizable and styled as before.

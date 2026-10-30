@@ -18,7 +18,8 @@ import traceback
 import sqlite3
 import subprocess
 import threading
-from collections import OrderedDict
+import hashlib
+from collections import OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -83,7 +84,7 @@ try:
     from PyQt6.QtGui import (
         QFont, QMouseEvent, QPixmap, QImage, QPainter, QPen, QBrush,
         QColor, QCursor, QDrag, QIcon, QPainterPath, QFontMetrics,
-        QWheelEvent, QKeyEvent, QPolygon
+        QWheelEvent, QKeyEvent, QPolygon, QLinearGradient
     )
 except ImportError:
     if not _install_python_package("PyQt6"):
@@ -105,7 +106,7 @@ except ImportError:
         from PyQt6.QtGui import (
             QFont, QMouseEvent, QPixmap, QImage, QPainter, QPen, QBrush,
             QColor, QCursor, QDrag, QIcon, QPainterPath, QFontMetrics,
-            QWheelEvent, QKeyEvent, QPolygon
+            QWheelEvent, QKeyEvent, QPolygon, QLinearGradient
         )
     except ImportError as import_error:
         _show_startup_error(
@@ -407,6 +408,10 @@ CONFIG_FILE = SAVE_DIR / "screenshot_tool_config.json"
 OCR_DB_PATH = SAVE_DIR / "ocr_index.db"
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 STARTUP_TRACE_PATH = SAVE_DIR / "startup_trace.log"
+# Small copies of every screenshot, so the gallery never has to decode full-size files twice.
+# Kept outside the save folder so OCR re-index, storage totals and folder lists never see them.
+THUMB_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "OtterlyScreenshots" / "thumbs"
+THUMB_MASTER_W, THUMB_MASTER_H = 640, 480
 
 
 def _trace_startup(message: str) -> None:
@@ -569,6 +574,115 @@ class ReindexWorker(QThread):
             done += 1
             self.progress.emit(done, total)
         self.finished.emit(done)
+
+
+# ============================================================================
+# THUMBNAILS (disk cache + background loader)
+# ============================================================================
+
+def _thumb_cache_base(filepath: Path) -> Optional[Path]:
+    """Cache file stem for one screenshot; changes whenever the file is edited or moved."""
+    try:
+        st = filepath.stat()
+    except OSError:
+        return None
+    digest = hashlib.sha1(f"{filepath}|{st.st_mtime_ns}|{st.st_size}".encode("utf-8")).hexdigest()
+    return THUMB_CACHE_DIR / digest[:2] / digest
+
+
+def load_thumbnail_master(filepath: Path) -> QImage:
+    """A copy of the screenshot no larger than THUMB_MASTER_W x THUMB_MASTER_H.
+
+    Read from the disk cache when it exists, otherwise made once from the full file and
+    written to the cache. QImage only, so it is safe to call from a worker thread.
+    """
+    base = _thumb_cache_base(filepath)
+    if base is not None:
+        for ext in (".jpg", ".png"):
+            cached = base.with_suffix(ext)
+            if cached.exists():
+                img = QImage(str(cached))
+                if not img.isNull():
+                    return img
+
+    img = QImage(str(filepath))
+    if img.isNull():
+        return QImage()
+    if img.width() > THUMB_MASTER_W or img.height() > THUMB_MASTER_H:
+        img = img.scaled(THUMB_MASTER_W, THUMB_MASTER_H,
+                         Qt.AspectRatioMode.KeepAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+
+    if base is not None:
+        try:
+            base.parent.mkdir(parents=True, exist_ok=True)
+            # Screenshots have no transparency, so JPEG keeps the cache small; imports with alpha stay PNG.
+            ext, fmt, quality = (".png", "PNG", -1) if img.hasAlphaChannel() else (".jpg", "JPG", 92)
+            tmp = base.parent / f"{base.name}.{threading.get_ident()}.tmp"
+            if img.save(str(tmp), fmt, quality):
+                os.replace(str(tmp), str(base.with_suffix(ext)))
+        except Exception as e:
+            logging.error(f"Thumbnail cache write failed for {filepath}: {e}")
+    return img
+
+
+def master_was_downscaled(img: QImage) -> bool:
+    """True when the cached master is smaller than the original screenshot."""
+    return img.width() >= THUMB_MASTER_W or img.height() >= THUMB_MASTER_H
+
+
+def grab_to_pixmap(sct, monitor) -> QPixmap:
+    """mss grab straight into a QPixmap (BGRA bytes are Qt's RGB32 layout; no PIL round trip)."""
+    shot = sct.grab(monitor)
+    image = QImage(shot.bgra, shot.width, shot.height, shot.width * 4, QImage.Format.Format_RGB32)
+    return QPixmap.fromImage(image.copy())  # copy: the mss buffer is freed when the grab goes away
+
+
+class ThumbnailLoader(QThread):
+    """Makes gallery thumbnails in the background so the window never waits on disk.
+
+    request() replaces the queue with the newest list (in gallery order, so the
+    thumbnails at the top of the window arrive first).
+    """
+    loaded = pyqtSignal(str, str, QImage)   # filepath, gallery cache key, master image (null = unreadable)
+
+    def __init__(self):
+        super().__init__()
+        self._cond = threading.Condition()
+        self._pending = deque()
+        self._stopping = False
+
+    def request(self, items: List[Tuple[str, str]]):
+        with self._cond:
+            self._pending = deque(items)
+            self._cond.notify()
+
+    def extend(self, items: List[Tuple[str, str]]):
+        with self._cond:
+            self._pending.extend(items)
+            self._cond.notify()
+
+    def stop(self):
+        with self._cond:
+            self._stopping = True
+            self._pending.clear()
+            self._cond.notify()
+        self.wait(5000)
+
+    def run(self):
+        while True:
+            with self._cond:
+                while not self._pending and not self._stopping:
+                    self._cond.wait()
+                if self._stopping:
+                    return
+                path, key = self._pending.popleft()
+            try:
+                img = load_thumbnail_master(Path(path))
+            except Exception as e:
+                logging.error(f"Thumbnail load failed for {path}: {e}")
+                img = QImage()
+            self.loaded.emit(path, key, img)
 
 
 # ============================================================================
@@ -1545,12 +1659,7 @@ class RegionSelector(QWidget):
 
         # Capture screen using mss (reliable at all DPI scales)
         with mss.mss() as sct:
-            monitor = sct.monitors[1]  # Primary monitor
-            screenshot = sct.grab(monitor)
-            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-            data = img.tobytes("raw", "RGB")
-            qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
-            self.full_capture = QPixmap.fromImage(qimage)
+            self.full_capture = grab_to_pixmap(sct, sct.monitors[1])  # Primary monitor
 
         # Get screen geometry and actual display scale
         screen = QApplication.primaryScreen()
@@ -1903,17 +2012,29 @@ class ThumbnailWidget(QFrame):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(0)
 
-        # Use cached thumbnail pixmap when provided, fallback to direct file load.
-        pixmap = thumbnail_pixmap if thumbnail_pixmap is not None else QPixmap(str(filepath))
-        if not pixmap.isNull():
-            self.thumb_label = QLabel()
-            self.thumb_label.setPixmap(pixmap)
-            self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.thumb_label.setStyleSheet("background: transparent;")
-            layout.addWidget(self.thumb_label)
+        # The picture arrives from the background ThumbnailLoader; never decode the full file here.
+        self.cache_key: Optional[str] = None
+        self.thumb_label = QLabel()
+        self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumb_label.setStyleSheet("background: transparent;")
+        layout.addWidget(self.thumb_label)
+        if thumbnail_pixmap is not None and not thumbnail_pixmap.isNull():
+            self.thumb_label.setPixmap(thumbnail_pixmap)
 
-        # OCR badge — top-right overlay
-        if ocr_indexed:
+        self.ocr_badge: Optional[QLabel] = None
+        self.set_ocr_indexed(ocr_indexed)
+
+    def set_thumbnail(self, pixmap: QPixmap, cache_key: Optional[str]):
+        self.thumb_label.setPixmap(pixmap)
+        self.cache_key = cache_key
+
+    def set_ocr_indexed(self, indexed: bool):
+        """OCR badge — top-right overlay."""
+        if not indexed:
+            if self.ocr_badge is not None:
+                self.ocr_badge.hide()
+            return
+        if self.ocr_badge is None:
             self.ocr_badge = QLabel("OCR", self)
             self.ocr_badge.setStyleSheet("""
                 background: #2AA198;
@@ -1925,7 +2046,8 @@ class ThumbnailWidget(QFrame):
             """)
             self.ocr_badge.setFixedSize(26, 14)
             self.ocr_badge.move(self.width() - 30, 4)
-            self.ocr_badge.raise_()
+        self.ocr_badge.show()
+        self.ocr_badge.raise_()
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1979,12 +2101,12 @@ class FolderHoverPreview(QFrame):
         zoom_height = zoom_width * 2
         shown = 0
         for img_path in image_paths[:3]:
-            pixmap = QPixmap(str(img_path))
-            if pixmap.isNull():
+            preview = self._preview_pixmap(img_path, zoom_width, zoom_height)
+            if preview.isNull():
                 continue
             lbl = QLabel()
             lbl.setFixedSize(zoom_width, zoom_height)
-            lbl.setPixmap(self._scaled_cropped(pixmap, zoom_width, zoom_height))
+            lbl.setPixmap(preview)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(lbl)
             shown += 1
@@ -1993,6 +2115,33 @@ class FolderHoverPreview(QFrame):
             empty = QLabel("No previews")
             empty.setStyleSheet(f"color: {Theme.TEXT_MUTED}; padding: 6px;")
             layout.addWidget(empty)
+
+    _preview_cache: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+
+    @classmethod
+    def _preview_pixmap(cls, img_path: Path, target_w: int, target_h: int) -> QPixmap:
+        """Zoomed crop for the hover popup, made once per image and size (hovering used to decode 3 full files)."""
+        base = _thumb_cache_base(img_path)
+        key = (str(base or img_path), target_w, target_h)
+        if key in cls._preview_cache:
+            cls._preview_cache.move_to_end(key)
+            return cls._preview_cache[key]
+
+        source = load_thumbnail_master(img_path)
+        if source.isNull():
+            return QPixmap()
+        # The popup zooms in; go back to the full file only when the small copy would be blown up.
+        if (max(target_w / source.width(), target_h / source.height()) > 1.0
+                and master_was_downscaled(source)):
+            full = QImage(str(img_path))
+            if not full.isNull():
+                source = full
+        preview = cls._scaled_cropped(QPixmap.fromImage(source), target_w, target_h)
+
+        cls._preview_cache[key] = preview
+        if len(cls._preview_cache) > 60:
+            cls._preview_cache.popitem(last=False)
+        return preview
 
     @staticmethod
     def _scaled_cropped(pixmap: QPixmap, target_w: int, target_h: int) -> QPixmap:
@@ -2023,12 +2172,14 @@ class FolderPreviewWidget(QWidget):
         self.preview_thumb_width = max(18, int(preview_width))
         self.preview_thumb_height = max(24, int(preview_height))
         self._source_pixmaps: List[QPixmap] = []
+        self._slot_cache: Dict[tuple, QPixmap] = {}
 
-        # Keep up to three most-recent screenshots for miniature strip rendering.
+        # Keep up to three most-recent screenshots for miniature strip rendering
+        # (small cached copies, not full-size files held in memory).
         for img_path in self.images[:3]:
-            pixmap = QPixmap(str(img_path))
-            if not pixmap.isNull():
-                self._source_pixmaps.append(pixmap)
+            master = load_thumbnail_master(img_path)
+            if not master.isNull():
+                self._source_pixmaps.append(QPixmap.fromImage(master))
 
         # Fill the full folder-card preview area instead of a small centered icon.
         self.setMinimumWidth(max(110, self.preview_thumb_width * 3 + 12))
@@ -2106,11 +2257,11 @@ class FolderPreviewWidget(QWidget):
                     slot_h,
                 )
                 if i < len(self._source_pixmaps):
-                    preview = FolderButton._scaled_cropped(
-                        self._source_pixmaps[i],
-                        max(1, int(slot_rect.width())),
-                        max(1, int(slot_rect.height())),
-                    )
+                    slot_key = (i, max(1, int(slot_rect.width())), max(1, int(slot_rect.height())))
+                    preview = self._slot_cache.get(slot_key)
+                    if preview is None:
+                        preview = FolderButton._scaled_cropped(self._source_pixmaps[i], slot_key[1], slot_key[2])
+                        self._slot_cache[slot_key] = preview
                     clip = QPainterPath()
                     clip.addRoundedRect(QRectF(slot_rect.adjusted(0.5, 0.5, -0.5, -0.5)), 4, 4)
                     painter.save()
@@ -2167,12 +2318,21 @@ class FolderButton(QFrame):
         # Build recent image list for preview + hover panel
         folder_path = base_dir / folder_name if folder_name else base_dir
         if folder_path.exists():
-            images = sorted(
-                [f for f in folder_path.glob("*.png") if f.is_file()],
-                key=lambda x: x.stat().st_mtime,
-                reverse=True
-            )[:3]
-            self._preview_images = images
+            # scandir carries the dates on Windows: one disk call per folder, not two per file.
+            dated = []
+            try:
+                with os.scandir(folder_path) as it:
+                    for entry in it:
+                        if entry.name.lower().endswith(".png"):
+                            try:
+                                if entry.is_file():
+                                    dated.append((entry.stat().st_mtime, folder_path / entry.name))
+                            except OSError:
+                                continue
+            except OSError:
+                pass
+            dated.sort(key=lambda e: e[0], reverse=True)
+            self._preview_images = [p for _, p in dated[:3]]
 
         self.preview_widget = FolderPreviewWidget(
             self._preview_images,
@@ -4112,6 +4272,8 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     """Main application window"""
 
+    screenshot_written = pyqtSignal(str, bool)   # filepath, ok — from the background PNG writer
+
     def __init__(self):
         super().__init__()
         _trace_startup("MainWindow.__init__ start")
@@ -4124,8 +4286,35 @@ class MainWindow(QMainWindow):
         self._floating_bar_was_visible_before_capture = False
         self._cached_storage_bytes: Optional[int] = None
         self._thumb_pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
-        self._thumb_cache_max_entries = 500
+        # Must exceed the number of screenshots in a folder: a smaller LRU walked in gallery
+        # order never gets a hit (500 against 912 files re-decoded every image, ~27 s a refresh).
+        self._thumb_cache_max_entries = 5000
+        self._thumb_failed: set = set()              # cache keys of files that could not be read
+        self._thumb_widgets: Dict[str, ThumbnailWidget] = {}   # filepath -> widget, reused across refreshes
+        self._gallery_order: List[str] = []          # filepaths in the grid, in order
+        self._gallery_context: Optional[tuple] = None  # (folder, thumb w, thumb h) the widgets were built for
+        self._gallery_cols = 0
+        self._gallery_build: Optional[dict] = None     # the refresh whose widgets are still being created
+        self._gallery_build_gen = 0
+        self._gallery_build_pending = False
+        self._pending_save_paths: set = set()
         self._last_gallery_images: List[Path] = []
+
+        self._thumb_loader = ThumbnailLoader()
+        self._thumb_loader.loaded.connect(self._on_thumbnail_loaded)
+        self._thumb_loader.start()
+        QApplication.instance().aboutToQuit.connect(self._thumb_loader.stop)
+        self.screenshot_written.connect(self._on_screenshot_written)
+
+        # Coalesce bursts (window drag-resize, typing in search) into one gallery update.
+        self._reflow_timer = QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.setInterval(120)
+        self._reflow_timer.timeout.connect(self._reflow_gallery)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self._refresh_gallery)
         self._resize_margin = 8
         self._use_native_resize_hit_test = False  # stability-first: disable crash-prone hook
         # Qt6 + Python 3.14 has shown native crashes on first show() when frameless is enabled.
@@ -4324,19 +4513,45 @@ class MainWindow(QMainWindow):
 
         # Content area with splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(10)
+        splitter.setObjectName("mainSplitter")
+        splitter.setHandleWidth(0)  # Hide default handle
         splitter.setChildrenCollapsible(False)
+        splitter.setOpaqueResize(False)
         self.main_splitter = splitter
 
         # Sidebar
         sidebar = self._create_sidebar()
         splitter.addWidget(sidebar)
 
+        # Insert custom 3D line divider
+        class ThreeDLine(QWidget):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.setFixedWidth(5)  # Slightly thicker than right divider
+                self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            def paintEvent(self, event):
+                p = QPainter(self)
+                # Slightly different shade than background
+                bg = QColor(Theme.BG_GALLERY)
+                line = QColor(bg.red() + 10, bg.green() + 10, bg.blue() + 10)
+                p.fillRect(self.rect(), bg)
+                p.setPen(QPen(line, 5))
+                p.drawLine(self.width() // 2, 0, self.width() // 2, self.height())
+                p.end()
+
+        splitter.addWidget(ThreeDLine())
+
         # Gallery area
         gallery_container = self._create_gallery()
         splitter.addWidget(gallery_container)
 
-        splitter.setSizes([200, 700])
+        splitter.setSizes([200, 10, 700])
+        # Left divider is a permanent border, not user-resizable.
+        left_handle = splitter.handle(1)
+        left_handle.setEnabled(False)
+        left_handle.setCursor(Qt.CursorShape.ArrowCursor)
+        left_handle.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        splitter.setStyleSheet("")  # Remove default handle styling
         main_layout.addWidget(splitter)
 
         # Status bar + resize grip
@@ -4512,8 +4727,11 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
 
         gallery_splitter = QSplitter(Qt.Orientation.Horizontal)
-        gallery_splitter.setHandleWidth(10)
+        gallery_splitter.setObjectName("gallerySplitter")
+        gallery_splitter.setHandleWidth(0)  # Hide default handle
         gallery_splitter.setChildrenCollapsible(False)
+        gallery_splitter.setOpaqueResize(False)
+        gallery_splitter.splitterMoved.connect(lambda *_: self._reflow_timer.start())
         self.gallery_splitter = gallery_splitter
 
         # Left content: OCR status + gallery grid
@@ -4554,6 +4772,8 @@ class MainWindow(QMainWindow):
         self.gallery_scroll.setWidgetResizable(True)
         self.gallery_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.gallery_scroll.setStyleSheet(self._main_scrollbar_stylesheet())
+        # Move scrollbar 10px to the right for visual offset
+        self.gallery_scroll.setViewportMargins(0, 0, 10, 0)
 
         self.gallery_widget = QWidget()
         self.gallery_widget.setStyleSheet(f"background: {Theme.BG_DARK};")
@@ -4565,6 +4785,27 @@ class MainWindow(QMainWindow):
         self.gallery_scroll.setWidget(self.gallery_widget)
         main_layout.addWidget(self.gallery_scroll)
         gallery_splitter.addWidget(main_area)
+
+        # Insert custom right divider (3D line) to visually match left divider
+        class ThreeDLineRight(QWidget):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.setFixedWidth(5)  # Match left divider thickness
+                self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            def paintEvent(self, event):
+                p = QPainter(self)
+                bg = QColor(Theme.BG_DARK)
+                line = QColor(bg.red() + 10, bg.green() + 10, bg.blue() + 10)
+                grad = QLinearGradient(0, 0, self.width(), 0)
+                grad.setColorAt(0.0, bg)
+                grad.setColorAt(0.5, line)
+                grad.setColorAt(1.0, bg)
+                p.fillRect(self.rect(), grad)
+                p.setPen(QPen(line, 5))
+                p.drawLine(self.width() // 2, 0, self.width() // 2, self.height())
+                p.end()
+
+        gallery_splitter.addWidget(ThreeDLineRight())
 
         # Right sidebar: folders
         self.folder_sidebar = QFrame()
@@ -4586,6 +4827,7 @@ class MainWindow(QMainWindow):
         self.folder_scroll.setWidgetResizable(True)
         self.folder_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.folder_scroll.setStyleSheet(self._main_scrollbar_stylesheet())
+        self.folder_scroll.setViewportMargins(-3, 0, 10, 0)
 
         self.folder_widget = QWidget()
         self.folder_layout = QVBoxLayout(self.folder_widget)
@@ -4595,9 +4837,10 @@ class MainWindow(QMainWindow):
         self.folder_scroll.setWidget(self.folder_widget)
         sidebar_layout.addWidget(self.folder_scroll)
         gallery_splitter.addWidget(self.folder_sidebar)
-        gallery_splitter.setSizes([760, 260])
+        gallery_splitter.setSizes([760, 5, 260])
         gallery_splitter.setStretchFactor(0, 1)
         gallery_splitter.setStretchFactor(1, 0)
+        gallery_splitter.setStretchFactor(2, 0)
 
         layout.addWidget(gallery_splitter)
 
@@ -4734,17 +4977,18 @@ class MainWindow(QMainWindow):
 
     def _on_search_changed(self, text: str):
         self._search_query = text.strip()
-        self._refresh_gallery()
+        # Wait for a pause in typing instead of filtering on every keystroke.
+        self._search_timer.start()
 
     def _refresh_gallery(self, use_cached_images: bool = False):
-        """Refresh the thumbnail gallery"""
+        """Refresh the thumbnail gallery.
+
+        Widgets are kept between refreshes and only re-ordered; thumbnails that are not in
+        memory are made by the background ThumbnailLoader, so this never decodes a file.
+        """
         if not hasattr(self, 'gallery_grid'):
             return
-        # Clear existing
-        while self.gallery_grid.count():
-            item = self.gallery_grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        self._search_timer.stop()
 
         # Get images
         if self.current_folder:
@@ -4752,24 +4996,39 @@ class MainWindow(QMainWindow):
         else:
             folder_path = self.save_dir
 
+        thumb_size = self._gallery_thumb_size()
+        size_tag = f"{thumb_size.width()}x{thumb_size.height()}"
+        keys: Dict[str, str] = {}   # filepath -> thumbnail cache key (same format as _thumbnail_cache_key)
+
         if use_cached_images and self._last_gallery_images:
             images = list(self._last_gallery_images)
         else:
-            images = []
+            # Root/main view shows only files in the root save dir (not recursive),
+            # not files that were moved into subfolders.
+            # scandir: on Windows the directory listing already carries size and dates,
+            # so this costs one disk call per folder instead of three per file.
+            dated = []
             if folder_path.exists():
-                if self.current_folder is None:
-                    # Root/main view should show only files in the root save dir,
-                    # not files that were moved into subfolders.
-                    for item in folder_path.glob("*.png"):
-                        if item.is_file():
-                            images.append(item)
-                else:
-                    for item in folder_path.glob("*.png"):
-                        if item.is_file():
-                            images.append(item)
+                try:
+                    with os.scandir(folder_path) as it:
+                        for entry in it:
+                            if not entry.name.lower().endswith(".png"):
+                                continue
+                            try:
+                                if not entry.is_file():
+                                    continue
+                                st = entry.stat()
+                            except OSError:
+                                continue
+                            item = folder_path / entry.name
+                            keys[str(item)] = f"{item}|{st.st_mtime_ns}|{st.st_size}|{size_tag}"
+                            dated.append((st.st_mtime, item))
+                except OSError as e:
+                    logging.error(f"Gallery scan failed for {folder_path}: {e}")
 
             # Sort by modification time
-            images.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            dated.sort(key=lambda e: e[0], reverse=True)
+            images = [item for _, item in dated]
 
             # Filter by search query if active
             if self._search_query and OCR_AVAILABLE:
@@ -4785,38 +5044,169 @@ class MainWindow(QMainWindow):
 
             self._last_gallery_images = list(images)
 
-        # Calculate thumbnail size
-        scale = self.config.get('thumbnail_scale', 5)
-        thumb_size = QSize(80 + scale * 15, 60 + scale * 12)
+        cols = self._current_gallery_columns(thumb_size)
 
-        # Calculate columns
-        gallery_width = self.gallery_scroll.width() - 50
-        cols = max(1, gallery_width // (thumb_size.width() + 20))
+        # Another folder, thumbnail size or theme: none of the existing widgets can be reused.
+        context = (str(folder_path), thumb_size.width(), thumb_size.height(), get_active_theme())
+        if context != self._gallery_context:
+            self._clear_gallery_widgets()
+            self._gallery_context = context
 
         indexed_paths = set()
         if OCR_AVAILABLE and images:
             indexed_paths = self.ocr_index.get_indexed_filepaths(images)
 
-        # Add thumbnails
-        for i, img_path in enumerate(images):
-            indexed = OCR_AVAILABLE and str(img_path) in indexed_paths
-            cached_thumb = self._get_cached_thumbnail(img_path, thumb_size)
-            thumb = ThumbnailWidget(
-                img_path,
-                thumb_size,
-                ocr_indexed=indexed,
-                thumbnail_pixmap=cached_thumb if not cached_thumb.isNull() else None,
-            )
-            thumb.clicked.connect(self._on_thumbnail_click)
-            thumb.double_clicked.connect(self._open_image)
-            thumb.context_menu_requested.connect(self._thumbnail_context_menu)
+        order = [str(p) for p in images]
+        self._gallery_build_gen += 1
+        self._gallery_build = {
+            'gen': self._gallery_build_gen, 'order': order, 'keys': keys,
+            'indexed': indexed_paths, 'thumb_size': thumb_size, 'cols': cols, 'missing': [],
+        }
+        self._gallery_order = order
+        self._gallery_cols = cols
 
-            row = i // cols
-            col = i % cols
-            self.gallery_grid.addWidget(thumb, row, col)
+        self.gallery_widget.setUpdatesEnabled(False)
+        try:
+            # Widgets not wanted now: hidden while a search filters them out, removed otherwise.
+            wanted = set(order)
+            for path_str in list(self._thumb_widgets):
+                if path_str in wanted:
+                    continue
+                thumb = self._thumb_widgets[path_str]
+                thumb.hide()
+                if not self._search_query:
+                    del self._thumb_widgets[path_str]
+                    thumb.deleteLater()
+
+            # Take every widget out of the grid; the ones still wanted go back in order.
+            while self.gallery_grid.count():
+                self.gallery_grid.takeAt(0)
+
+            to_load: List[Tuple[str, str]] = []
+            for i, path_str in enumerate(order):
+                thumb = self._thumb_widgets.get(path_str)
+                if thumb is None:
+                    self._gallery_build['missing'].append(i)   # created below, a batch at a time
+                    continue
+                self._place_thumbnail(thumb, i, to_load)
+        finally:
+            self.gallery_widget.setUpdatesEnabled(True)
+
+        self._thumb_loader.request(to_load)
+        self._create_missing_thumbnails(self._gallery_build_gen)
 
         # Update disk usage
         self._update_disk_usage()
+
+    def _place_thumbnail(self, thumb: 'ThumbnailWidget', index: int, to_load: List[Tuple[str, str]]):
+        """Put one widget at its grid position, with its OCR badge and (cached or queued) picture."""
+        build = self._gallery_build
+        path_str = build['order'][index]
+        thumb.set_ocr_indexed(OCR_AVAILABLE and path_str in build['indexed'])
+
+        # A new file, or one edited since its thumbnail was made.
+        key = build['keys'].get(path_str) or self._thumbnail_cache_key(Path(path_str), build['thumb_size'])
+        if key and thumb.cache_key != key:
+            cached = self._thumb_pixmap_cache.get(key)
+            if cached is not None:
+                self._thumb_pixmap_cache.move_to_end(key)
+                thumb.set_thumbnail(cached, key)
+            elif key not in self._thumb_failed:
+                to_load.append((path_str, key))
+
+        cols = build['cols']
+        self.gallery_grid.addWidget(thumb, index // cols, index % cols)
+        thumb.show()
+
+    def _create_missing_thumbnails(self, gen: int):
+        """Create new thumbnail widgets a batch at a time so a large folder never locks the window.
+
+        The first batch (the top of the gallery) is made at once; the rest between events.
+        """
+        build = self._gallery_build
+        if not build or build['gen'] != gen:
+            return  # a newer refresh took over
+        missing = build['missing']
+        if not missing:
+            self._gallery_build_pending = False
+            if self._current_gallery_columns(build['thumb_size']) != self._gallery_cols:
+                self._reflow_gallery()
+            return
+
+        self._gallery_build_pending = True
+        batch, build['missing'] = missing[:80], missing[80:]
+        to_load: List[Tuple[str, str]] = []
+        self.gallery_widget.setUpdatesEnabled(False)
+        try:
+            for i in batch:
+                path_str = build['order'][i]
+                thumb = ThumbnailWidget(Path(path_str), build['thumb_size'])
+                thumb.clicked.connect(self._on_thumbnail_click)
+                thumb.double_clicked.connect(self._open_image)
+                thumb.context_menu_requested.connect(self._thumbnail_context_menu)
+                self._thumb_widgets[path_str] = thumb
+                self._place_thumbnail(thumb, i, to_load)
+        finally:
+            self.gallery_widget.setUpdatesEnabled(True)
+        if to_load:
+            self._thumb_loader.extend(to_load)
+        QTimer.singleShot(0, lambda g=gen: self._create_missing_thumbnails(g))
+
+    def _gallery_thumb_size(self) -> QSize:
+        scale = self.config.get('thumbnail_scale', 5)
+        return QSize(80 + scale * 15, 60 + scale * 12)
+
+    def _clear_gallery_widgets(self):
+        """Delete every thumbnail widget (folder or thumbnail size changed)."""
+        while self.gallery_grid.count():
+            self.gallery_grid.takeAt(0)
+        for thumb in self._thumb_widgets.values():
+            thumb.hide()
+            thumb.deleteLater()
+        self._thumb_widgets.clear()
+        self._gallery_order = []
+
+    def _reflow_gallery(self, force: bool = False):
+        """Re-grid the existing thumbnails in gallery order (window/splitter resize, or after a delete)."""
+        if not hasattr(self, 'gallery_grid') or self._gallery_build_pending:
+            return  # a build still creating widgets re-flows itself when it finishes
+        cols = self._current_gallery_columns(self._gallery_thumb_size())
+        if cols == self._gallery_cols and not force:
+            return
+        self.gallery_widget.setUpdatesEnabled(False)
+        try:
+            while self.gallery_grid.count():
+                self.gallery_grid.takeAt(0)
+            i = 0
+            for path_str in self._gallery_order:
+                thumb = self._thumb_widgets.get(path_str)
+                if thumb is None:
+                    continue
+                self.gallery_grid.addWidget(thumb, i // cols, i % cols)
+                i += 1
+        finally:
+            self.gallery_widget.setUpdatesEnabled(True)
+        self._gallery_cols = cols
+
+    def _on_thumbnail_loaded(self, path_str: str, key: str, master: QImage):
+        """A thumbnail made by the background loader: cache it and put it on its widget."""
+        if master.isNull():
+            self._thumb_failed.add(key)
+            return
+        thumb_size = self._gallery_thumb_size()
+        if not key.endswith(f"|{thumb_size.width()}x{thumb_size.height()}"):
+            return  # thumbnail size changed while it was being made; a new request is queued
+        pixmap = QPixmap.fromImage(master.scaled(
+            thumb_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+        self._thumb_pixmap_cache[key] = pixmap
+        if len(self._thumb_pixmap_cache) > self._thumb_cache_max_entries:
+            self._thumb_pixmap_cache.popitem(last=False)
+        thumb = self._thumb_widgets.get(path_str)
+        if thumb is not None:
+            thumb.set_thumbnail(pixmap, key)
 
     def _current_gallery_columns(self, thumb_size: QSize) -> int:
         """Calculate how many columns fit in the current gallery viewport."""
@@ -4831,30 +5221,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _get_cached_thumbnail(self, filepath: Path, thumb_size: QSize) -> QPixmap:
-        """Get a scaled thumbnail pixmap from cache, generating it once when needed."""
-        key = self._thumbnail_cache_key(filepath, thumb_size)
-        if key and key in self._thumb_pixmap_cache:
-            self._thumb_pixmap_cache.move_to_end(key)
-            return self._thumb_pixmap_cache[key]
-
-        source = QPixmap(str(filepath))
-        if source.isNull():
-            return QPixmap()
-
-        scaled = source.scaled(
-            thumb_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-
-        if key:
-            self._thumb_pixmap_cache[key] = scaled
-            if len(self._thumb_pixmap_cache) > self._thumb_cache_max_entries:
-                self._thumb_pixmap_cache.popitem(last=False)
-
-        return scaled
-
     def _invalidate_thumbnail_cache(self, filepath: Optional[Path] = None):
         """Invalidate thumbnail cache entries for one file or clear everything."""
         if filepath is None:
@@ -4868,30 +5234,17 @@ class MainWindow(QMainWindow):
 
     def _remove_thumbnail_from_gallery(self, filepath: Path) -> bool:
         """Remove one thumbnail widget and reflow existing widgets without rebuilding all thumbnails."""
-        scale = self.config.get('thumbnail_scale', 5)
-        thumb_size = QSize(80 + scale * 15, 60 + scale * 12)
-        cols = self._current_gallery_columns(thumb_size)
-
-        widgets = []
-        removed = False
-
-        while self.gallery_grid.count():
-            item = self.gallery_grid.takeAt(0)
-            widget = item.widget()
-            if not widget:
-                continue
-            if isinstance(widget, ThumbnailWidget) and widget.filepath == filepath:
-                widget.deleteLater()
-                removed = True
-            else:
-                widgets.append(widget)
-
-        for i, widget in enumerate(widgets):
-            row = i // cols
-            col = i % cols
-            self.gallery_grid.addWidget(widget, row, col)
-
-        return removed
+        path_str = str(filepath)
+        thumb = self._thumb_widgets.pop(path_str, None)
+        if thumb is not None:
+            thumb.hide()
+            thumb.deleteLater()
+        if self._gallery_build_pending or path_str not in self._gallery_order:
+            return False  # caller falls back to a full refresh
+        # Grid insertion order is not display order (widgets are created in batches), so re-flow by path order.
+        self._gallery_order = [p for p in self._gallery_order if p != path_str]
+        self._reflow_gallery(force=True)
+        return True
 
     def _on_thumbnail_click(self, filepath: Path):
         """Handle single click on thumbnail"""
@@ -5197,25 +5550,18 @@ class MainWindow(QMainWindow):
         if image.format() != QImage.Format.Format_RGB32:
             image = image.convertToFormat(QImage.Format.Format_RGB32)
 
-        # Get raw bytes
         width = image.width()
         height = image.height()
-        ptr = image.bits()
-        ptr.setsize(height * width * 4)
 
         # Create BMP data (DIB format for clipboard)
-        # DIB is bottom-up, so we need to flip
-        output = BytesIO()
-        for y in range(height - 1, -1, -1):
-            row_start = y * width * 4
-            row_end = row_start + width * 4
-            output.write(bytes(ptr[row_start:row_end]))
-
-        data = output.getvalue()
-        output.close()
+        # DIB is bottom-up: flip once in Qt instead of copying row by row in Python.
+        # (RGB32 rows are always width * 4 bytes, so the buffer needs no repacking.)
+        flipped = image.mirrored(False, True)
+        ptr = flipped.constBits()
+        ptr.setsize(flipped.sizeInBytes())
+        data = bytes(ptr)
 
         # Create BITMAPINFOHEADER
-        import struct
         header = struct.pack('<IiiHHIIiiII',
             40,           # biSize
             width,        # biWidth
@@ -5337,16 +5683,8 @@ class MainWindow(QMainWindow):
     def _capture_fullscreen_after_hide(self):
         """Capture full screen once app windows are fully hidden."""
         with mss.mss() as sct:
-            monitor = sct.monitors[0]
-            screenshot = sct.grab(monitor)
-            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-
-            # Convert to QPixmap
-            data = img.tobytes("raw", "RGB")
-            qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimage)
-
-            self._process_capture(pixmap)
+            pixmap = grab_to_pixmap(sct, sct.monitors[0])
+        self._process_capture(pixmap)
 
     def _start_window_capture(self):
         """Start window capture"""
@@ -5424,16 +5762,8 @@ class MainWindow(QMainWindow):
 
             # Pass physical coords directly to mss (both use physical pixels)
             with mss.mss() as sct:
-                monitor = {"left": x, "top": y, "width": w, "height": h}
-                screenshot = sct.grab(monitor)
-                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-
-                # Convert to QPixmap
-                data = img.tobytes("raw", "RGB")
-                qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format.Format_RGB888)
-                pixmap = QPixmap.fromImage(qimage)
-
-                self._process_capture(pixmap)
+                pixmap = grab_to_pixmap(sct, {"left": x, "top": y, "width": w, "height": h})
+            self._process_capture(pixmap)
         except Exception as e:
             logging.error(f"Window capture failed: {e}")
             self._capture_cancelled()
@@ -5472,15 +5802,27 @@ class MainWindow(QMainWindow):
         else:
             save_path = self.save_dir / filename
 
-        # Save to disk
-        pixmap.save(str(save_path), "PNG")
-        self._invalidate_thumbnail_cache(save_path)
+        # Two captures in the same second must not write the same file.
+        i = 1
+        while save_path.exists() or str(save_path) in self._pending_save_paths:
+            save_path = save_path.with_name(f"screenshot_{timestamp}_{i}.png")
+            i += 1
+        filename = save_path.name
 
-        # Keep storage usage cache in sync without rescanning entire folder tree.
-        try:
-            self._cached_storage_bytes = (self._cached_storage_bytes or 0) + save_path.stat().st_size
-        except Exception:
-            self._cached_storage_bytes = None
+        # Save to disk in the background: PNG-encoding a full screen takes ~1 s and used to
+        # freeze the window. The gallery, folder bar and OCR follow in _on_screenshot_written.
+        self._pending_save_paths.add(str(save_path))
+        image = pixmap.toImage()
+
+        def _write(image=image, path=str(save_path)):
+            try:
+                ok = image.save(path, "PNG")
+            except Exception as e:
+                logging.error(f"Failed to save screenshot {path}: {e}")
+                ok = False
+            self.screenshot_written.emit(path, ok)
+
+        threading.Thread(target=_write, name="otterly-save", daemon=False).start()
 
         # Update state
         self.session_count += 1
@@ -5493,14 +5835,6 @@ class MainWindow(QMainWindow):
         # Show window if not silent
         self._restore_capture_ui()
 
-        # Defer gallery refresh (non-blocking)
-        QTimer.singleShot(100, self._refresh_folder_bar)
-        QTimer.singleShot(100, self._refresh_gallery)
-
-        # Fire OCR in background
-        if OCR_AVAILABLE:
-            self._start_ocr(save_path)
-
         # Auto-send: desktop override (from FloatingBar) takes priority over config
         target = self._desktop_target_override or (
             self.config.get('auto_send_target', '')
@@ -5509,6 +5843,28 @@ class MainWindow(QMainWindow):
         self._desktop_target_override = None  # consume override
         if target:
             QTimer.singleShot(500, lambda t=target: self._send_to_target(t))
+
+    def _on_screenshot_written(self, path_str: str, ok: bool):
+        """Background PNG write finished: update storage, gallery, folder bar and OCR."""
+        self._pending_save_paths.discard(path_str)
+        save_path = Path(path_str)
+        if not ok:
+            self._set_status(f"Failed to save: {save_path.name}")
+            return
+        self._invalidate_thumbnail_cache(save_path)
+
+        # Keep storage usage cache in sync without rescanning entire folder tree.
+        try:
+            self._cached_storage_bytes = (self._cached_storage_bytes or 0) + save_path.stat().st_size
+        except Exception:
+            self._cached_storage_bytes = None
+
+        self._refresh_folder_bar()
+        self._refresh_gallery()
+
+        # Fire OCR in background
+        if OCR_AVAILABLE:
+            self._start_ocr(save_path)
 
     def _inject_desktop_target(self):
         """
@@ -5834,8 +6190,9 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         """Handle window resize"""
         super().resizeEvent(event)
-        # Refresh gallery to adjust columns
-        QTimer.singleShot(100, self._refresh_gallery)
+        # Re-flow the existing thumbnails once the drag settles (no rescan, no rebuild).
+        if hasattr(self, '_reflow_timer'):
+            self._reflow_timer.start()
 
     def _pin_to_all_desktops(self):
         """Pin the window to appear on all virtual desktops"""
