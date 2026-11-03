@@ -18,6 +18,7 @@ import traceback
 import sqlite3
 import subprocess
 import threading
+import time
 import hashlib
 from collections import OrderedDict, deque
 from datetime import datetime
@@ -3636,12 +3637,21 @@ class ScreenshotEditor(QMainWindow):
         p.drawPixmap(0, 0, self.original_pixmap)
         p.drawPixmap(0, 0, self.overlay_pixmap)
         p.end()
+        self._finished = True
         self.editing_complete.emit(result)
         self.close()
 
     def _cancel(self):
+        self._finished = True
         self.editing_cancelled.emit()
         self.close()
+
+    def closeEvent(self, event):
+        # The window's own X is a cancel too, or a caller waiting on the editor never hears back.
+        if not getattr(self, '_finished', False):
+            self._finished = True
+            self.editing_cancelled.emit()
+        super().closeEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Escape:
@@ -3737,6 +3747,12 @@ class SettingsDialog(QDialog):
         self.edit_check.setChecked(config.get('edit_before_save', True))
         self.edit_check.setStyleSheet(f"color: {Theme.TEXT_DARK};")
         layout.addWidget(self.edit_check)
+
+        # Edit after save: the capture is saved first, so closing the editor never loses it
+        self.edit_after_check = QCheckBox("Open editor after save (saving the edit copies it to the clipboard)")
+        self.edit_after_check.setChecked(config.get('edit_after_save', True))
+        self.edit_after_check.setStyleSheet(f"color: {Theme.TEXT_DARK};")
+        layout.addWidget(self.edit_after_check)
 
         # Silent capture
         self.silent_check = QCheckBox("Silent capture (don't show window)")
@@ -4248,6 +4264,7 @@ class SettingsDialog(QDialog):
         delay_text = self.delay_combo.currentText()
         self.config['delay'] = int(delay_text.split()[0])
         self.config['edit_before_save'] = self.edit_check.isChecked()
+        self.config['edit_after_save'] = self.edit_after_check.isChecked()
         self.config['silent_capture'] = self.silent_check.isChecked()
         self.config['pin_to_all_desktops'] = self.pin_check.isChecked()
         self.config['floating_bar_visible'] = self.floating_bar_check.isChecked()
@@ -4273,6 +4290,7 @@ class MainWindow(QMainWindow):
     """Main application window"""
 
     screenshot_written = pyqtSignal(str, bool)   # filepath, ok — from the background PNG writer
+    edit_written = pyqtSignal(str, bool, int)    # filepath, ok, size change — an editor save written
 
     def __init__(self):
         super().__init__()
@@ -4298,6 +4316,7 @@ class MainWindow(QMainWindow):
         self._gallery_build_gen = 0
         self._gallery_build_pending = False
         self._pending_save_paths: set = set()
+        self._save_threads: Dict[str, threading.Thread] = {}   # filepath -> its latest background write
         self._last_gallery_images: List[Path] = []
 
         self._thumb_loader = ThumbnailLoader()
@@ -4305,6 +4324,7 @@ class MainWindow(QMainWindow):
         self._thumb_loader.start()
         QApplication.instance().aboutToQuit.connect(self._thumb_loader.stop)
         self.screenshot_written.connect(self._on_screenshot_written)
+        self.edit_written.connect(self._on_edit_written)
 
         # Coalesce bursts (window drag-resize, typing in search) into one gallery update.
         self._reflow_timer = QTimer(self)
@@ -4433,6 +4453,7 @@ class MainWindow(QMainWindow):
             'theme': 'solarized_dark',
             'delay': 0,
             'edit_before_save': True,
+            'edit_after_save': True,
             'silent_capture': False,
             'pin_to_all_desktops': False,
             'thumbnail_scale': 5,
@@ -5513,14 +5534,68 @@ class MainWindow(QMainWindow):
         self.editor.show()
 
     def _save_edited(self, pixmap: QPixmap, filepath: Path):
-        """Save edited image back to file"""
+        """Save edited image back to file and copy it to the clipboard."""
         try:
-            pixmap.save(str(filepath), "PNG")
-            self._invalidate_thumbnail_cache(filepath)
-            self._refresh_gallery()
-            self._set_status("Image saved")
+            self._copy_pixmap_to_clipboard(pixmap)
+            copied = True
         except Exception as e:
-            StyledDialog.warning(self, "Error", f"Failed to save: {e}")
+            logging.error(f"Clipboard copy of edited image failed: {e}")
+            copied = False
+
+        # Written in the background like a capture; it waits for the capture's own write of
+        # the same file (the editor can open before that write has finished).
+        path = str(filepath)
+        image = pixmap.toImage()
+        before = self._save_threads.get(path)
+
+        def _write(image=image, path=path, before=before):
+            if before is not None:
+                before.join()
+            try:
+                old_size = os.path.getsize(path) if os.path.exists(path) else 0
+                # Written beside it and swapped in, so the gallery or OCR never reads a half-written
+                # file. Windows refuses the swap while another program has the file open: retry, then
+                # write in place.
+                tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".edit-tmp")
+                ok = image.save(tmp, "PNG")
+                if ok:
+                    for _ in range(20):
+                        try:
+                            os.replace(tmp, path)
+                            break
+                        except PermissionError:
+                            time.sleep(0.1)
+                    else:
+                        ok = image.save(path, "PNG")
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
+                delta = (os.path.getsize(path) - old_size) if ok else 0
+            except Exception as e:
+                logging.error(f"Failed to save edited image {path}: {e}")
+                ok, delta = False, 0
+            self.edit_written.emit(path, ok, delta)
+
+        t = threading.Thread(target=_write, name="otterly-save-edit", daemon=False)
+        self._save_threads[path] = t
+        t.start()
+        self._set_status("Edited image copied to clipboard" if copied else "Saving edited image...")
+
+    def _on_edit_written(self, path_str: str, ok: bool, delta: int):
+        """Background write of an edited image finished."""
+        self._save_threads = {p: t for p, t in self._save_threads.items() if t.is_alive()}
+        filepath = Path(path_str)
+        if not ok:
+            StyledDialog.warning(self, "Error", f"Failed to save: {filepath.name}")
+            return
+        if self._cached_storage_bytes is not None:
+            self._cached_storage_bytes += delta
+        self._invalidate_thumbnail_cache(filepath)
+        self._refresh_gallery()
+        self._set_status(f"Edited image saved: {filepath.name} (copied to clipboard)")
+        if OCR_AVAILABLE:
+            self._start_ocr(filepath)    # the edit may have added text
 
     def _copy_to_clipboard(self, filepath: Path):
         """Copy image to clipboard"""
@@ -5822,7 +5897,9 @@ class MainWindow(QMainWindow):
                 ok = False
             self.screenshot_written.emit(path, ok)
 
-        threading.Thread(target=_write, name="otterly-save", daemon=False).start()
+        t = threading.Thread(target=_write, name="otterly-save", daemon=False)
+        self._save_threads[str(save_path)] = t
+        t.start()
 
         # Update state
         self.session_count += 1
@@ -5841,12 +5918,39 @@ class MainWindow(QMainWindow):
             if self.config.get('auto_send_enabled', False) else ''
         )
         self._desktop_target_override = None  # consume override
+
+        # Edit after save (not when the editor already ran before the save). Saving the edit
+        # overwrites this file and copies it to the clipboard; closing the editor keeps the
+        # capture as it was. An auto-send waits for the editor so the edited image is sent.
+        if self.config.get('edit_after_save', True) and not self.config.get('edit_before_save', True):
+            self._open_editor_after_save(pixmap, save_path, target)
+            return
         if target:
             QTimer.singleShot(500, lambda t=target: self._send_to_target(t))
+
+    def _open_editor_after_save(self, pixmap: QPixmap, save_path: Path, target: str = ''):
+        editor = ScreenshotEditor(pixmap)
+
+        def _done_edit(p, save_path=save_path, target=target):
+            self._save_edited(p, save_path)
+            if target:
+                QTimer.singleShot(500, lambda t=target: self._send_to_target(t))
+
+        def _closed(target=target):
+            if target:
+                QTimer.singleShot(500, lambda t=target: self._send_to_target(t))
+
+        editor.editing_complete.connect(_done_edit)
+        editor.editing_cancelled.connect(_closed)
+        self.editor = editor
+        editor.show()
+        editor.raise_()
+        editor.activateWindow()
 
     def _on_screenshot_written(self, path_str: str, ok: bool):
         """Background PNG write finished: update storage, gallery, folder bar and OCR."""
         self._pending_save_paths.discard(path_str)
+        self._save_threads = {p: t for p, t in self._save_threads.items() if t.is_alive()}
         save_path = Path(path_str)
         if not ok:
             self._set_status(f"Failed to save: {save_path.name}")

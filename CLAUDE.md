@@ -170,6 +170,24 @@ Paul: "it is SLOW". Measured on his 912 root screenshots (offscreen harness, sam
 - Proof scripts (scratchpad, not in repo): harness2.py (timings), functest.py (29 checks on a scratch copy).
 - Backup of the file before this change: `screenshot_tool_pyqt.py.bak_pre_speedup_2026_10_30`.
 
+## Edit after save (2026-10-30)
+
+Paul: *"after a save it automatically opens the edit mode. When I save the edit it automatically gets
+saved to the clipboard."* Setting `edit_after_save` (default on; Settings: "Open editor after save").
+- `_save_screenshot` saves and copies the capture as before, then `_open_editor_after_save` opens the
+  editor on it. Closing the editor (Esc, Cancel or the window's X) keeps the capture as it was.
+- Saving the edit (`_save_edited`, also used when editing from the gallery) copies the edited image to
+  the clipboard at once and overwrites the file in the background: it waits for the capture's own
+  write of that file (the editor opens before it finishes), writes a hidden `.<name>.edit-tmp` and
+  swaps it in, so the gallery and OCR never read a half-written file. `_on_edit_written` refreshes the
+  tile, the storage total and re-runs OCR.
+- An auto-send (config or floating-bar target) waits for the editor: edited image if saved, the
+  capture if closed.
+- With "Edit before save" on, that editor runs instead and no second one opens after the save.
+- `ScreenshotEditor.closeEvent` now emits `editing_cancelled` for the window's X; before, closing an
+  edit-before-save editor that way left `capture_in_progress` stuck.
+- Proof: functest2.py (scratchpad), 53 checks. Backup: `screenshot_tool_pyqt.py.bak_pre_edit_after_save_2026_10_30`.
+
 ## Recent Updates
 - 2026-03-08: Improved gallery responsiveness for delete/save flows in `screenshot_tool_pyqt.py`.
 - Delete now removes thumbnail widgets incrementally (no full gallery rebuild for a single delete).
