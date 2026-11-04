@@ -246,6 +246,27 @@ characters."* The 🎤 button sits on the editor toolbar right after T (an actio
   notetest.py, movetest.py and functest2.py all pass. Backups:
   `screenshot_tool_pyqt.py.bak_pre_voice_note_2026_11_04`, `...bak_pre_whisper_2026_11_04`.
 
+## Several editors open at once (2026-11-04)
+
+Paul: *"have one edit box open, and then if I record a new snippet or a new window ... a new edit box
+to open with that one, leaving the old one the way it was."*
+- Before: MainWindow kept ONE `self.editor`. A new capture reassigned it, the old editor lost its last
+  Python reference and was destroyed, drawing and all. With "Edit before save" on, a new capture was
+  blocked outright (`capture_in_progress` stayed True while that editor was open).
+- Now every editor goes through `_open_editor()`, which holds it in `self._editors` until it closes
+  (then `deleteLater`). There is no `self.editor` any more.
+- A capture hides the open editors so they are not in the shot (`_prepare_capture_ui` records them in
+  `_editors_hidden_for_capture`), and `_restore_capture_ui` shows them again where they were, on
+  save and on cancel. Minimised editors are left alone.
+- A new editor that would open exactly on top of another (same size, same centred spot) steps 32 px
+  down-right, or sideways when a full-screen one has no room below, so the one under it shows.
+- Edit before save: the capture counts as over once its editor is up, so the next capture can start.
+  Saving that editor while another capture runs does not show the main window into that shot
+  (`_save_screenshot(..., from_editor=True)`); closing it only says "Capture cancelled".
+- Proof: functest3.py (scratchpad; functest2.py with `w.editor` replaced, plus 32 checks for two and
+  three editors, same-size and full-screen captures, cancel, edit-before-save), movetest, notetest
+  and speechtest all pass. Backup: `screenshot_tool_pyqt.py.bak_pre_many_editors_2026_11_04`.
+
 ## Restarting the app (read before killing it)
 `OtterlyScreenshots.vbs` waits on the hidden pythonw copy, and if that copy exits with a code other
 than 0 (a kill) it opens a visible `cmd /k python.exe` copy as a crash fallback. So stop the waiting

@@ -5082,6 +5082,10 @@ class MainWindow(QMainWindow):
         # State
         self.current_folder: Optional[str] = None
         self.capture_in_progress = False
+        # Every open editor window. Each capture (or gallery edit) opens its own; the ones already
+        # open stay as they are. A capture hides them while it runs and shows them again after.
+        self._editors: list = []
+        self._editors_hidden_for_capture: list = []
         self.session_count = 0
         self._main_was_visible_before_capture = False
         self._floating_bar_was_visible_before_capture = False
@@ -6312,9 +6316,50 @@ class MainWindow(QMainWindow):
             StyledDialog.warning(self, "Error", "Failed to load image")
             return
 
-        self.editor = ScreenshotEditor(pixmap)
-        self.editor.editing_complete.connect(lambda p: self._save_edited(p, filepath))
-        self.editor.show()
+        editor = ScreenshotEditor(pixmap)
+        editor.editing_complete.connect(lambda p: self._save_edited(p, filepath))
+        self._open_editor(editor)
+
+    def _open_editor(self, editor: 'ScreenshotEditor'):
+        """Show an editor as a window of its own, beside any already open."""
+        # Open editors are held here; dropping the last reference would destroy the window.
+        self._editors.append(editor)
+
+        def _forget(*_args, editor=editor):
+            # After the editor has closed itself: let it go and free the window.
+            def _drop():
+                if editor in self._editors:
+                    self._editors.remove(editor)
+                if editor in self._editors_hidden_for_capture:
+                    self._editors_hidden_for_capture.remove(editor)
+                editor.deleteLater()
+            QTimer.singleShot(0, _drop)
+
+        editor.editing_complete.connect(_forget)
+        editor.editing_cancelled.connect(_forget)
+
+        # Every editor opens centred: step a new one down-right off any editor in the same
+        # place, so the one underneath can still be seen.
+        pos = editor.pos()
+        screen = QApplication.primaryScreen().availableGeometry()
+        taken = [e.pos() for e in self._editors if e is not editor and e.isVisible()]
+        for _ in range(12):
+            if not any(abs(p.x() - pos.x()) < 16 and abs(p.y() - pos.y()) < 16 for p in taken):
+                break
+            # A full-screen capture's editor has no room below: step it sideways instead.
+            for step in (QPoint(32, 32), QPoint(32, 0), QPoint(0, 32)):
+                nxt = pos + step
+                if (nxt.x() + editor.width() <= screen.right() + 1
+                        and nxt.y() + editor.height() <= screen.bottom() + 1):
+                    break
+            else:
+                break
+            pos = nxt
+        editor.move(pos)
+
+        editor.show()
+        editor.raise_()
+        editor.activateWindow()
 
     def _save_edited(self, pixmap: QPixmap, filepath: Path):
         """Save edited image back to file and copy it to the clipboard."""
@@ -6572,6 +6617,12 @@ class MainWindow(QMainWindow):
         if self.isVisible():
             self.hide()
 
+        # Open editors leave the screen for the capture and come back, as they were, after it.
+        for ed in self._editors:
+            if ed.isVisible() and not ed.isMinimized() and ed not in self._editors_hidden_for_capture:
+                self._editors_hidden_for_capture.append(ed)
+                ed.hide()
+
         # Safety: hide any stray top-level Otterly windows that might still be shown.
         for w in QApplication.topLevelWidgets():
             if not w.isVisible():
@@ -6606,6 +6657,12 @@ class MainWindow(QMainWindow):
         ):
             QTimer.singleShot(120, self.floating_bar.show)
 
+        # The editors that were open before the capture, back where they were.
+        hidden, self._editors_hidden_for_capture = self._editors_hidden_for_capture, []
+        for ed in hidden:
+            if ed in self._editors:
+                ed.show()
+
         self._main_was_visible_before_capture = False
         self._floating_bar_was_visible_before_capture = False
 
@@ -6635,16 +6692,25 @@ class MainWindow(QMainWindow):
     def _process_capture(self, pixmap: QPixmap):
         """Process captured screenshot"""
         if self.config.get('edit_before_save', True):
-            self.editor = ScreenshotEditor(pixmap)
-            self.editor.editing_complete.connect(self._save_screenshot)
-            self.editor.editing_cancelled.connect(self._capture_cancelled)
-            self.editor.show()
+            # The capture is over once its editor is up: the next capture may start while this
+            # editor is open, and opens an editor of its own.
+            self.capture_in_progress = False
+            self._restore_capture_ui()
+            editor = ScreenshotEditor(pixmap)
+            editor.editing_complete.connect(lambda p: self._save_screenshot(p, from_editor=True))
+            editor.editing_cancelled.connect(self._edit_before_save_cancelled)
+            self._open_editor(editor)
         else:
             self._save_screenshot(pixmap)
 
-    def _save_screenshot(self, pixmap: QPixmap):
+    def _edit_before_save_cancelled(self):
+        """An editor opened before saving was closed without saving."""
+        self._set_status("Capture cancelled")
+
+    def _save_screenshot(self, pixmap: QPixmap, from_editor: bool = False):
         """Save screenshot to disk"""
-        self.capture_in_progress = False
+        if not from_editor:
+            self.capture_in_progress = False
 
         # Copy to clipboard FIRST (instant feedback)
         self._copy_pixmap_to_clipboard(pixmap)
@@ -6692,8 +6758,9 @@ class MainWindow(QMainWindow):
         self.toast = ToastNotification(pixmap, filename)
         self._set_status(f"Saved: {filename}")
 
-        # Show window if not silent
-        self._restore_capture_ui()
+        # Show window if not silent (not while another capture, started from an open editor, runs)
+        if not self.capture_in_progress:
+            self._restore_capture_ui()
 
         # Auto-send: desktop override (from FloatingBar) takes priority over config
         target = self._desktop_target_override or (
@@ -6725,10 +6792,7 @@ class MainWindow(QMainWindow):
 
         editor.editing_complete.connect(_done_edit)
         editor.editing_cancelled.connect(_closed)
-        self.editor = editor
-        editor.show()
-        editor.raise_()
-        editor.activateWindow()
+        self._open_editor(editor)
 
     def _on_screenshot_written(self, path_str: str, ok: bool):
         """Background PNG write finished: update storage, gallery, folder bar and OCR."""
