@@ -188,6 +188,31 @@ saved to the clipboard."* Setting `edit_after_save` (default on; Settings: "Open
   edit-before-save editor that way left `capture_in_progress` stuck.
 - Proof: functest2.py (scratchpad), 53 checks. Backup: `screenshot_tool_pyqt.py.bak_pre_edit_after_save_2026_10_30`.
 
+## Movable objects in the editor (2026-11-03)
+
+Paul: *"any object that I make on the chart should be movable."* The editor used to paint every stroke
+straight into `overlay_pixmap`, so nothing could be picked up again. Now every annotation is an object
+(a dict in `ScreenshotEditor._objects`: highlight, pen, line, arrow, rect, circle, blur, text, stamped
+measure line/rect), each with its own colour, size and geometry plus a `dx`/`dy` offset.
+`_paint_object` draws one; `_render_overlay` rebuilds `overlay_pixmap` from the list, oldest first.
+- **Move tool** (first toolbar button, key **V**): click an object to select it (dashed teal box, on
+  screen only), drag to move, **Delete**/Backspace removes it. **Ctrl+drag** moves an object from any
+  tool without switching. The cursor turns into the move cross over anything that can be picked up.
+- Picking (`_hit_object`): top-most first, and a drawn line beats the inside of a shape, so an arrow
+  inside a rectangle is still grabbed on its shaft; the empty inside of a rect, circle, blur box or text
+  grabs that object. Tolerance 6 screen pixels.
+- A moved blur box redacts whatever is under it at its new place. A drag stops at the picture's edge.
+- Undo stores object lists, not pictures: a move or a delete is one undo step; a click that moves
+  nothing adds none. While dragging, the objects below and above are rendered once
+  (`overlay_pixmap`, `_above_pixmap`) and only the dragged one is repainted (`preview_pixmap`):
+  ~18-25 ms a step on a 2560x1440 picture with 30 objects.
+- Drawing looks exactly as before (pixel-identical), except a stamped measurement is now smoothed, as
+  its live preview always was. Text's pick-up box comes from the font's ascent/advance
+  (`boundingRect` gives a broken rect under Qt's offscreen platform).
+- Proof: movetest.py (scratchpad: each kind drawn = old editor, each kind moved = drawn at the new place,
+  undo/delete/Ctrl+drag/picking/edges/hover), run offscreen and on the Windows platform; functest2.py
+  still 53/53. Backup: `screenshot_tool_pyqt.py.bak_pre_move_objects_2026_11_03`.
+
 ## Recent Updates
 - 2026-03-08: Improved gallery responsiveness for delete/save flows in `screenshot_tool_pyqt.py`.
 - Delete now removes thumbnail widgets incrementally (no full gallery rebuild for a single delete).

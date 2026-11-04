@@ -2592,9 +2592,19 @@ class ScreenshotEditor(QMainWindow):
         self.stroke_pixmap = QPixmap(pixmap.size())
         self.stroke_pixmap.fill(Qt.GlobalColor.transparent)
         self._stroke_points: list = []   # accumulated points for current highlight stroke
+        self._pen_points: list = []      # points of the current pen stroke
         self._straight_marker = False     # lock highlight to horizontal
 
-        # Undo stack — list of overlay QPixmap snapshots
+        # Every annotation is kept as an object (a dict) so it can be picked up and
+        # moved later; overlay_pixmap is rendered from this list, oldest first.
+        self._objects: list = []
+        self._selected = None            # the object picked by the move tool / Ctrl+drag
+        self._drag = None                # state while an object is being dragged
+        self._above_pixmap = None        # objects stacked above the dragged one
+        self._mode_cursor = QCursor(Qt.CursorShape.CrossCursor)
+        self._hover_grab = False
+
+        # Undo stack — list of object-list snapshots
         self._undo_stack: list = []
 
         self._setup_ui()
@@ -2674,6 +2684,8 @@ class ScreenshotEditor(QMainWindow):
             return b
 
         tools_def = [
+            ('move',         self._make_icon_move(),          '✥ Move  [V]  — drag anything you drew; Del removes it.  '
+                                                              'Ctrl+drag moves in any tool'),
             ('highlight',    self._make_icon_highlight(),     '🖌 Marker  [H]'),
             ('pen',          self._make_icon_pen(),           '✏ Pen  [P]'),
             ('line',         self._make_icon_line(),          '╱ Straight line  [L]'),
@@ -2849,6 +2861,19 @@ class ScreenshotEditor(QMainWindow):
         p = QPainter(px)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         return px, p
+
+    def _make_icon_move(self):
+        px, p = self._blank_icon()
+        col = QColor(40, 40, 40)
+        p.setPen(QPen(col, 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(QPoint(17, 5), QPoint(17, 29))
+        p.drawLine(QPoint(5, 17), QPoint(29, 17))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        for tip, a, b in (((17, 2), (12, 8), (22, 8)), ((17, 32), (12, 26), (22, 26)),
+                          ((2, 17), (8, 12), (8, 22)), ((32, 17), (26, 12), (26, 22))):
+            p.drawPolygon(QPolygon([QPoint(*tip), QPoint(*a), QPoint(*b)]))
+        p.end(); return px
 
     def _make_icon_highlight(self):
         import os
@@ -3168,27 +3193,38 @@ class ScreenshotEditor(QMainWindow):
                 self.canvas.setCursor(Qt.CursorShape.SizeAllCursor)
         elif mode == 'text':
             self.canvas.setCursor(Qt.CursorShape.IBeamCursor)
+        elif mode == 'move':
+            self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
         elif mode in ('measure_line', 'measure_rect'):
             self.canvas.setCursor(Qt.CursorShape.CrossCursor)
         else:
             self.canvas.setCursor(Qt.CursorShape.CrossCursor)
+        self._mode_cursor = self.canvas.cursor()
+        self._hover_grab = False
+        if mode != 'move' and self._selected is not None:
+            self._selected = None
+            self._update_canvas()
 
     def _on_size_changed(self, v: int):
         self.brush_size = v
         self.size_value.setText(str(v))
 
-    def _push_undo(self):
-        """Snapshot current overlay onto undo stack (max 30 levels)."""
-        snap = self.overlay_pixmap.copy()
-        self._undo_stack.append(snap)
+    def _push_undo(self, snap=None):
+        """Snapshot the object list onto the undo stack (max 30 levels)."""
+        self._undo_stack.append(snap if snap is not None
+                                else [dict(o) for o in self._objects])
         if len(self._undo_stack) > 30:
             self._undo_stack.pop(0)
 
     def _undo(self):
+        if self.drawing or self._drag:
+            return
         if self._undo_stack:
-            self.overlay_pixmap = self._undo_stack.pop()
+            self._objects = self._undo_stack.pop()
+            self._selected = None
             self.preview_pixmap.fill(Qt.GlobalColor.transparent)
             self.stroke_pixmap.fill(Qt.GlobalColor.transparent)
+            self._render_overlay()
             self._update_canvas()
 
     def _update_canvas(self):
@@ -3199,15 +3235,290 @@ class ScreenshotEditor(QMainWindow):
         p.drawPixmap(0, 0, self.overlay_pixmap)
         p.drawPixmap(0, 0, self.stroke_pixmap)
         p.drawPixmap(0, 0, self.preview_pixmap)
+        if self._above_pixmap is not None:
+            p.drawPixmap(0, 0, self._above_pixmap)
         p.end()
         scaled = result.scaled(self.display_size,
                                Qt.AspectRatioMode.KeepAspectRatio,
                                Qt.TransformationMode.SmoothTransformation)
+        if self._selected is not None and not self.drawing:
+            # Selection box: drawn at screen scale so it stays a crisp line; never saved.
+            box = self._obj_bbox(self._selected)
+            s = self.scale_factor
+            r = QRectF(box.x() * s, box.y() * s,
+                       box.width() * s, box.height() * s).adjusted(-3, -3, 3, 3)
+            sp = QPainter(scaled)
+            sp.setBrush(Qt.BrushStyle.NoBrush)
+            sp.setPen(QPen(QColor(255, 255, 255, 230), 1.5))
+            sp.drawRect(r)
+            sp.setPen(QPen(QColor(42, 161, 152), 1.5, Qt.PenStyle.DashLine))
+            sp.drawRect(r)
+            sp.end()
         self.canvas.setPixmap(scaled)
 
     def _canvas_to_image_pos(self, pos: QPoint) -> QPoint:
         return QPoint(int(pos.x() / self.scale_factor),
                       int(pos.y() / self.scale_factor))
+
+    # ── annotation objects ───────────────────────────────────────────────────
+
+    def _render_objects(self, objs) -> QPixmap:
+        px = QPixmap(self.original_pixmap.size())
+        px.fill(Qt.GlobalColor.transparent)
+        if objs:
+            p = QPainter(px)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            for o in objs:
+                self._paint_object(p, o)
+            p.end()
+        return px
+
+    def _render_overlay(self):
+        self.overlay_pixmap = self._render_objects(self._objects)
+
+    def _text_font(self, size: int) -> QFont:
+        font = QFont("Segoe UI", size)
+        font.setBold(True)
+        return font
+
+    def _paint_object(self, p: QPainter, o: dict):
+        """Paint one annotation at its current place (its stored geometry + dx/dy)."""
+        k = o['kind']
+        dx, dy = o.get('dx', 0), o.get('dy', 0)
+        if k == 'blur':
+            # A moved redaction box covers whatever is under it now.
+            self._paint_mosaic(p, o['rect'].translated(dx, dy), o['tile'])
+            return
+        p.save()
+        p.translate(dx, dy)
+        if k == 'highlight':
+            # Own layer, painted with Source so overlapping dabs keep one flat alpha.
+            box = o['bbox']
+            layer = QPixmap(box.size())
+            layer.fill(Qt.GlobalColor.transparent)
+            lp = QPainter(layer)
+            lp.setRenderHint(QPainter.RenderHint.Antialiasing)
+            lp.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            lp.setPen(Qt.PenStyle.NoPen)
+            lp.setBrush(o['color'])
+            lp.translate(-box.left(), -box.top())
+            r = o['r']
+            for (x, y) in o['points']:
+                lp.drawEllipse(QPoint(x, y), r, r)
+            lp.end()
+            p.drawPixmap(box.topLeft(), layer)
+        elif k == 'pen':
+            p.setPen(QPen(o['color'], o['width'], Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawPolyline(QPolygon(o['points']))
+        elif k == 'line':
+            p.setPen(QPen(o['color'], o['width'], Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap))
+            p.drawLine(o['a'], o['b'])
+        elif k == 'arrow':
+            self._draw_arrow(p, o['a'], o['b'], o['width'], o['color'])
+        elif k in ('rect', 'circle'):
+            p.setPen(QPen(o['color'], o['width']))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            if k == 'rect':
+                p.drawRect(o['rect'])
+            else:
+                p.drawEllipse(o['rect'])
+        elif k == 'text':
+            p.setPen(o['color'])
+            p.setFont(self._text_font(o['size']))
+            p.drawText(o['pos'], o['text'])
+        elif k == 'measure_line':
+            self._draw_measure_line_preview(p, o['a'], o['b'])
+        elif k == 'measure_rect':
+            self._draw_measure_rect_preview(p, o['a'], o['b'], o['aspect'])
+        p.restore()
+
+    def _shape_object(self, mode: str, a: QPoint, b: QPoint, modifiers):
+        """The object a shape tool makes from a drag from a to b (None if nothing)."""
+        pen_w = max(2, self.brush_size // 4)
+        c = self.current_color
+        opaque = QColor(c.red(), c.green(), c.blue())
+        if mode in ('line', 'arrow'):
+            if abs(b.x() - a.x()) + abs(b.y() - a.y()) < 2:
+                return None
+            return {'kind': mode, 'a': QPoint(a), 'b': QPoint(b),
+                    'color': opaque, 'width': pen_w}
+        if mode in ('rect', 'circle'):
+            r = QRect(a, b).normalized()
+            if r.width() < 3 and r.height() < 3:
+                return None
+            return {'kind': mode, 'rect': r, 'color': QColor(c), 'width': pen_w}
+        if mode == 'blur':
+            r = QRect(a, b).normalized()
+            if r.width() <= 4 or r.height() <= 4:
+                return None
+            return {'kind': 'blur', 'rect': r, 'tile': max(4, self.brush_size // 3)}
+        if mode == 'measure_line':
+            return {'kind': 'measure_line', 'a': QPoint(a), 'b': QPoint(b)}
+        if mode == 'measure_rect':
+            shift = modifiers & Qt.KeyboardModifier.ShiftModifier
+            end = self._snap_aspect(a, b) if (self._measure_aspect != 'free' or shift) else b
+            return {'kind': 'measure_rect', 'a': QPoint(a), 'b': QPoint(end),
+                    'aspect': self._measure_aspect}
+        return None
+
+    def _add_object(self, obj: dict):
+        self._push_undo()
+        obj.setdefault('dx', 0)
+        obj.setdefault('dy', 0)
+        self._objects.append(obj)
+
+    def _obj_bbox(self, o: dict) -> QRect:
+        """Bounding box of an object where it sits now."""
+        k = o['kind']
+        if k in ('highlight', 'text'):
+            box = QRect(o['bbox'])
+        elif k == 'pen':
+            w = o['width']
+            box = QPolygon(o['points']).boundingRect().adjusted(-w, -w, w, w)
+        elif k in ('line', 'arrow'):
+            m = max(12, o['width'] * 4) if k == 'arrow' else o['width']
+            box = QRect(o['a'], o['b']).normalized().adjusted(-m, -m, m, m)
+        elif k in ('rect', 'circle'):
+            w = o['width']
+            box = o['rect'].adjusted(-w, -w, w, w)
+        elif k == 'blur':
+            box = QRect(o['rect'])
+        elif k == 'measure_line':
+            a, b = o['a'], o['b']
+            mx, my = (a.x() + b.x()) // 2, (a.y() + b.y()) // 2
+            box = QRect(a, b).normalized().adjusted(-8, -8, 8, 8).united(
+                QRect(mx - 45, my - 28, 90, 28))
+        else:   # measure_rect
+            r = QRect(o['a'], o['b']).normalized()
+            box = r.adjusted(-8, -28, 8, 28).united(
+                QRect(r.center().x() - 90, r.top() - 28, 180, 1))
+        return box.translated(o.get('dx', 0), o.get('dy', 0))
+
+    @staticmethod
+    def _seg_dist(px, py, ax, ay, bx, by) -> float:
+        import math
+        vx, vy = bx - ax, by - ay
+        ll = vx * vx + vy * vy
+        t = 0.0 if ll == 0 else max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / ll))
+        return math.hypot(px - (ax + t * vx), py - (ay + t * vy))
+
+    def _hits_stroke(self, o: dict, x: int, y: int, tol: float) -> bool:
+        """True if (x, y), in the object's own unmoved coordinates, is on its drawn line."""
+        import math
+        k = o['kind']
+        if k == 'highlight':
+            lim = (o['r'] + tol) ** 2
+            return any((x - px) ** 2 + (y - py) ** 2 <= lim for (px, py) in o['points'])
+        if k == 'pen':
+            pts = o['points']
+            lim = o['width'] / 2 + tol
+            return any(self._seg_dist(x, y, a.x(), a.y(), b.x(), b.y()) <= lim
+                       for a, b in zip(pts, pts[1:]))
+        if k in ('line', 'arrow', 'measure_line'):
+            a, b = o['a'], o['b']
+            w = o.get('width', 2)
+            if self._seg_dist(x, y, a.x(), a.y(), b.x(), b.y()) <= w / 2 + tol:
+                return True
+            # the arrowhead is wider than the shaft
+            return k == 'arrow' and math.hypot(x - b.x(), y - b.y()) <= max(12, w * 4) + tol
+        if k in ('rect', 'measure_rect'):
+            r = o['rect'] if k == 'rect' else QRect(o['a'], o['b']).normalized()
+            lim = o.get('width', 2) / 2 + tol
+            near_x = r.left() - lim <= x <= r.right() + lim
+            near_y = r.top() - lim <= y <= r.bottom() + lim
+            return ((near_y and (abs(x - r.left()) <= lim or abs(x - r.right()) <= lim)) or
+                    (near_x and (abs(y - r.top()) <= lim or abs(y - r.bottom()) <= lim)))
+        if k == 'circle':
+            r = o['rect']
+            rx, ry = max(r.width() / 2, 1), max(r.height() / 2, 1)
+            cx, cy = r.left() + r.width() / 2, r.top() + r.height() / 2
+            d = math.hypot((x - cx) / rx, (y - cy) / ry)
+            return abs(d - 1) * min(rx, ry) <= o['width'] / 2 + tol
+        return False
+
+    def _hits_area(self, o: dict, x: int, y: int) -> bool:
+        """True if (x, y) is inside a filled area or a closed shape."""
+        k = o['kind']
+        if k in ('rect', 'blur'):
+            return o['rect'].contains(x, y)
+        if k == 'measure_rect':
+            return QRect(o['a'], o['b']).normalized().contains(x, y)
+        if k == 'text':
+            return o['bbox'].adjusted(-4, -4, 4, 4).contains(x, y)
+        if k == 'circle':
+            r = o['rect']
+            rx, ry = max(r.width() / 2, 1), max(r.height() / 2, 1)
+            cx, cy = r.left() + r.width() / 2, r.top() + r.height() / 2
+            return ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1
+        return False
+
+    def _hit_object(self, pos: QPoint):
+        """The object under pos, top-most first. A line beats the inside of a shape,
+        so an arrow drawn inside a rectangle can still be picked."""
+        tol = max(3.0, 6 / self.scale_factor)
+        for o in reversed(self._objects):
+            x, y = pos.x() - o.get('dx', 0), pos.y() - o.get('dy', 0)
+            if (self._obj_bbox(o).translated(-o.get('dx', 0), -o.get('dy', 0))
+                    .adjusted(-int(tol), -int(tol), int(tol), int(tol)).contains(x, y)
+                    and self._hits_stroke(o, x, y, tol)):
+                return o
+        for o in reversed(self._objects):
+            if self._hits_area(o, pos.x() - o.get('dx', 0), pos.y() - o.get('dy', 0)):
+                return o
+        return None
+
+    def _index_of(self, obj) -> int:
+        return next(i for i, o in enumerate(self._objects) if o is obj)
+
+    def _begin_drag(self, obj: dict, pos: QPoint):
+        i = self._index_of(obj)
+        self._drag = {'obj': obj, 'start': pos, 'dx': obj.get('dx', 0), 'dy': obj.get('dy', 0),
+                      'snap': [dict(o) for o in self._objects], 'moved': False}
+        # Render what sits below and above the dragged object once; each mouse move
+        # then only repaints the object itself, in its own place in the stack.
+        self.overlay_pixmap = self._render_objects(self._objects[:i])
+        above = self._objects[i + 1:]
+        self._above_pixmap = self._render_objects(above) if above else None
+        self._render_dragged()
+        self.canvas.setCursor(Qt.CursorShape.SizeAllCursor)
+
+    def _render_dragged(self):
+        self.preview_pixmap.fill(Qt.GlobalColor.transparent)
+        p = QPainter(self.preview_pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._paint_object(p, self._drag['obj'])
+        p.end()
+
+    def _end_drag(self):
+        d = self._drag
+        self._drag = None
+        if d['moved']:
+            self._push_undo(d['snap'])
+        self._above_pixmap = None
+        self.preview_pixmap.fill(Qt.GlobalColor.transparent)
+        self._render_overlay()
+        self._update_canvas()
+
+    def _delete_selected(self):
+        if self._selected is None or self._drag or self.drawing:
+            return
+        self._push_undo()
+        i = self._index_of(self._selected)
+        del self._objects[i]
+        self._selected = None
+        self._hover_grab = False
+        self.canvas.setCursor(self._mode_cursor)
+        self._render_overlay()
+        self._update_canvas()
+
+    def _hover(self, pos: QPoint, ctrl: bool):
+        """Show the move cursor over an object when it can be picked up."""
+        grab = (self.draw_mode == 'move' or ctrl) and self._hit_object(pos) is not None
+        if grab != self._hover_grab:
+            self._hover_grab = grab
+            self.canvas.setCursor(Qt.CursorShape.SizeAllCursor if grab else self._mode_cursor)
 
     # ── event filter ─────────────────────────────────────────────────────────
 
@@ -3225,38 +3536,68 @@ class ScreenshotEditor(QMainWindow):
     # ── drawing ──────────────────────────────────────────────────────────────
 
     def _on_press(self, event: QMouseEvent):
-        if event.button() != Qt.MouseButton.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton or self._drag or self.drawing:
             return
         pos = self._canvas_to_image_pos(event.pos())
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+
+        # Move tool, or Ctrl held in any tool: pick up the object under the cursor.
+        if self.draw_mode == 'move' or ctrl:
+            hit = self._hit_object(pos)
+            self._selected = hit
+            if hit is not None:
+                self._begin_drag(hit, pos)
+            self._update_canvas()
+            return
+
+        if self._selected is not None:
+            self._selected = None
+            self._update_canvas()
 
         if self.draw_mode == 'text':
             text, ok = QInputDialog.getText(self, "Add Text", "Enter text:")
             if ok and text:
-                self._push_undo()
+                c = self.current_color
+                opaque = QColor(c.red(), c.green(), c.blue())
+                font = self._text_font(self.brush_size)
                 p = QPainter(self.overlay_pixmap)
-                p.setRenderHint(QPainter.RenderHint.Antialiasing)
-                opaque = QColor(self.current_color.red(),
-                                self.current_color.green(),
-                                self.current_color.blue())
-                p.setPen(opaque)
-                font = QFont("Segoe UI", self.brush_size)
-                font.setBold(True)
                 p.setFont(font)
-                p.drawText(pos, text)
+                fm = p.fontMetrics()
+                bbox = QRect(pos.x(), pos.y() - fm.ascent(),
+                             fm.horizontalAdvance(text), fm.ascent() + fm.descent())
                 p.end()
+                self._add_object({'kind': 'text', 'pos': QPoint(pos), 'text': text,
+                                  'color': opaque, 'size': self.brush_size, 'bbox': bbox})
+                self._render_overlay()
                 self._update_canvas()
             return
 
-        self._push_undo()
         self.drawing = True
         self.start_point = pos
         self.last_point = pos
         self._stroke_points = []   # reset point accumulator for new stroke
+        self._pen_points = [QPoint(pos)]
 
     def _on_move(self, event: QMouseEvent):
-        if not self.drawing:
-            return
         pos = self._canvas_to_image_pos(event.pos())
+        if self._drag:
+            # Keep the grab point on the picture so the object can always be picked up again.
+            img = self.original_pixmap.size()
+            pos = QPoint(min(max(pos.x(), 0), img.width() - 1),
+                         min(max(pos.y(), 0), img.height() - 1))
+            d = self._drag
+            o = d['obj']
+            nx = d['dx'] + pos.x() - d['start'].x()
+            ny = d['dy'] + pos.y() - d['start'].y()
+            if (nx, ny) != (o['dx'], o['dy']):
+                o['dx'], o['dy'] = nx, ny
+                d['moved'] = True
+                self._render_dragged()
+                self._update_canvas()
+            return
+        if not self.drawing:
+            self._hover(pos, bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier))
+            return
         mode = self.draw_mode
 
         # ── freehand modes ──
@@ -3296,7 +3637,8 @@ class ScreenshotEditor(QMainWindow):
                     p.drawEllipse(QPoint(x, y), r, r)
                 p.end()
             else:
-                # pen — thin opaque line direct to overlay
+                # pen — thin opaque line direct to overlay; the stroke becomes an
+                # object on release
                 p = QPainter(self.overlay_pixmap)
                 p.setRenderHint(QPainter.RenderHint.Antialiasing)
                 opaque = QColor(self.current_color.red(),
@@ -3309,122 +3651,80 @@ class ScreenshotEditor(QMainWindow):
                 p.setPen(pen)
                 p.drawLine(self.last_point, pos)
                 p.end()
+                self._pen_points.append(QPoint(pos))
             self.last_point = pos
             self._update_canvas()
             return
 
-        # ── shape preview modes ──
+        # ── shape preview modes: paint the object the release would make ──
         self.preview_pixmap.fill(Qt.GlobalColor.transparent)
         p = QPainter(self.preview_pixmap)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen_w = max(2, self.brush_size // 4)
-
-        if mode == 'line':
-            opaque = QColor(self.current_color.red(),
-                            self.current_color.green(),
-                            self.current_color.blue())
-            pen = QPen(opaque, pen_w,
-                       Qt.PenStyle.SolidLine,
-                       Qt.PenCapStyle.RoundCap)
-            p.setPen(pen)
-            p.drawLine(self.start_point, pos)
-
-        elif mode == 'arrow':
-            self._draw_arrow(p, self.start_point, pos, pen_w)
-
-        elif mode == 'circle':
-            pen = QPen(self.current_color, pen_w)
-            p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRect(self.start_point, pos).normalized())
-
-        elif mode == 'rect':
-            pen = QPen(self.current_color, pen_w)
-            p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(QRect(self.start_point, pos).normalized())
-
-        elif mode == 'blur':
-            # Live mosaic preview + visible double border (black + white dashes)
+        obj = self._shape_object(mode, self.start_point, pos, event.modifiers())
+        if obj is not None:
+            self._paint_object(p, obj)
+        if mode == 'blur':
+            # visible double border (black + white dashes) round the live mosaic
             r = QRect(self.start_point, pos).normalized()
-            if r.width() > 4 and r.height() > 4:
-                self._paint_blur_preview(p, r)
             pen1 = QPen(QColor(0, 0, 0, 200), 2, Qt.PenStyle.SolidLine)
             pen2 = QPen(QColor(255, 255, 255, 230), 2, Qt.PenStyle.DashLine)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(pen1); p.drawRect(r)
             p.setPen(pen2); p.drawRect(r)
-
-        elif mode == 'measure_line':
-            self._draw_measure_line_preview(p, self.start_point, pos)
-
-        elif mode == 'measure_rect':
-            shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-            # Snap if: ratio is locked, OR Shift is held (nearest ratio)
-            if self._measure_aspect != 'free' or shift:
-                snapped = self._snap_aspect(self.start_point, pos)
-            else:
-                snapped = pos
-            self._draw_measure_rect_preview(p, self.start_point, snapped)
-
         p.end()
         self._update_canvas()
 
     def _on_release(self, event: QMouseEvent):
+        if self._drag:
+            self._end_drag()
+            return
         if not self.drawing:
             return
         pos = self._canvas_to_image_pos(event.pos())
         mode = self.draw_mode
+        obj = None
 
         if mode == 'highlight':
-            # Merge completed stroke layer into overlay, then clear stroke layer
-            p = QPainter(self.overlay_pixmap)
-            p.drawPixmap(0, 0, self.stroke_pixmap)
-            p.end()
+            pts = self._stroke_points
+            if pts:
+                r = self.brush_size // 2
+                xs = [x for x, _ in pts]
+                ys = [y for _, y in pts]
+                c = self.current_color
+                obj = {'kind': 'highlight', 'points': list(pts), 'r': r,
+                       'color': QColor(c.red(), c.green(), c.blue(), 130),
+                       'bbox': QRect(QPoint(min(xs) - r - 2, min(ys) - r - 2),
+                                     QPoint(max(xs) + r + 2, max(ys) + r + 2))}
             self.stroke_pixmap.fill(Qt.GlobalColor.transparent)
             self._stroke_points = []
         elif mode == 'pen':
-            pass  # pen draws direct to overlay already
+            if len(self._pen_points) >= 2:
+                c = self.current_color
+                obj = {'kind': 'pen', 'points': list(self._pen_points),
+                       'color': QColor(c.red(), c.green(), c.blue()),
+                       'width': max(1, self.brush_size // 4)}
+            self._pen_points = []
         else:
-            # Commit shape preview to overlay
-            if mode == 'blur':
-                rect = QRect(self.start_point, pos).normalized()
-                if rect.width() > 4 and rect.height() > 4:
-                    self._apply_blur(rect)
-            elif mode in ('measure_line', 'measure_rect'):
-                if self._measure_stamp:
-                    # Stamp measurement permanently onto overlay
-                    p = QPainter(self.overlay_pixmap)
-                    if mode == 'measure_line':
-                        self._draw_measure_line_preview(p, self.start_point, pos)
-                    else:
-                        if self._measure_aspect != 'free':
-                            end = self._snap_aspect(self.start_point, pos)
-                        else:
-                            shift = event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-                            end = self._snap_aspect(self.start_point, pos) if shift else pos
-                        self._draw_measure_rect_preview(p, self.start_point, end)
-                    p.end()
-                # Either way, clear the live preview
-                self.preview_pixmap.fill(Qt.GlobalColor.transparent)
-            else:
-                p = QPainter(self.overlay_pixmap)
-                p.drawPixmap(0, 0, self.preview_pixmap)
-                p.end()
+            obj = self._shape_object(mode, self.start_point, pos, event.modifiers())
+            if mode in ('measure_line', 'measure_rect') and not self._measure_stamp:
+                obj = None   # measurements vanish on release unless stamped
             self.preview_pixmap.fill(Qt.GlobalColor.transparent)
 
+        if obj is not None:
+            self._add_object(obj)
         self.drawing = False
         self.start_point = None
         self.last_point = None
+        self._render_overlay()
         self._update_canvas()
 
     # ── arrow helper ─────────────────────────────────────────────────────────
 
-    def _draw_arrow(self, painter: QPainter, src: QPoint, dst: QPoint, pen_w: int):
+    def _draw_arrow(self, painter: QPainter, src: QPoint, dst: QPoint, pen_w: int,
+                    color: QColor = None):
         import math
-        opaque = QColor(self.current_color.red(),
-                        self.current_color.green(),
-                        self.current_color.blue())
+        c = color if color is not None else self.current_color
+        opaque = QColor(c.red(), c.green(), c.blue())
         pen = QPen(opaque, pen_w, Qt.PenStyle.SolidLine,
                    Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
@@ -3455,9 +3755,11 @@ class ScreenshotEditor(QMainWindow):
 
     # ── blur helper ──────────────────────────────────────────────────────────
 
-    def _paint_blur_preview(self, painter: QPainter, rect: QRect):
-        """Paint a live mosaic preview into an already-open painter (preview layer)."""
-        tile = max(4, self.brush_size // 3)
+    def _paint_mosaic(self, painter: QPainter, rect: QRect, tile: int):
+        """Paint a pixelated mosaic of the screenshot under rect into an open painter."""
+        rect = rect.intersected(self.original_pixmap.rect())
+        if rect.width() < 1 or rect.height() < 1:
+            return
         region = self.original_pixmap.copy(rect)
         small = region.scaled(
             max(1, rect.width() // tile), max(1, rect.height() // tile),
@@ -3468,24 +3770,6 @@ class ScreenshotEditor(QMainWindow):
             Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.FastTransformation)
         painter.drawPixmap(rect.topLeft(), mosaic)
-
-    def _apply_blur(self, rect: QRect):
-        """Commit pixelated mosaic onto overlay layer."""
-        tile = max(4, self.brush_size // 3)
-        region = self.original_pixmap.copy(rect)
-        small = region.scaled(
-            max(1, rect.width() // tile), max(1, rect.height() // tile),
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.FastTransformation)
-        mosaic = small.scaled(
-            rect.width(), rect.height(),
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.FastTransformation)
-        p = QPainter(self.overlay_pixmap)
-        # Use SourceOver so it paints opaque pixels onto the transparent overlay
-        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        p.drawPixmap(rect.topLeft(), mosaic)
-        p.end()
 
     # ── measure helpers ──────────────────────────────────────────────────────
 
@@ -3592,8 +3876,9 @@ class ScreenshotEditor(QMainWindow):
         mx, my = (a.x()+b.x())//2, (a.y()+b.y())//2
         self._draw_label_box(p, f"{px_len} px", mx, my - 14)
 
-    def _draw_measure_rect_preview(self, p: QPainter, a: QPoint, b: QPoint):
+    def _draw_measure_rect_preview(self, p: QPainter, a: QPoint, b: QPoint, aspect: str = None):
         """Draw a measurement rectangle with W×H, aspect ratio, and MP labels."""
+        aspect = self._measure_aspect if aspect is None else aspect
         r = QRect(a, b).normalized()
         if r.width() < 2 or r.height() < 2:
             return
@@ -3614,8 +3899,8 @@ class ScreenshotEditor(QMainWindow):
         g = math.gcd(w, h)
         ratio_w, ratio_h = w//g, h//g
         # If a ratio is locked, show that name; otherwise resolve from actual dimensions
-        if self._measure_aspect != 'free':
-            ratio_str = '🔒 ' + self._measure_aspect
+        if aspect != 'free':
+            ratio_str = '🔒 ' + aspect
         else:
             named = {(16,9):'16:9',(4,3):'4:3',(1,1):'1:1',(3,2):'3:2',
                      (21,9):'21:9',(9,16):'9:16',(2,3):'2:3'}
@@ -3632,6 +3917,10 @@ class ScreenshotEditor(QMainWindow):
     # ── save / cancel ────────────────────────────────────────────────────────
 
     def _save(self):
+        if self._drag:      # Enter pressed mid-drag: drop the object where it is
+            self._drag = None
+            self._above_pixmap = None
+            self._render_overlay()
         result = QPixmap(self.original_pixmap.size())
         p = QPainter(result)
         p.drawPixmap(0, 0, self.original_pixmap)
@@ -3661,8 +3950,11 @@ class ScreenshotEditor(QMainWindow):
         elif event.modifiers() & Qt.KeyboardModifier.ControlModifier and \
              event.key() == Qt.Key.Key_Z:
             self._undo()
+        elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._delete_selected()
         # Keyboard shortcuts for tools
         shortcuts = {
+            Qt.Key.Key_V: 'move',
             Qt.Key.Key_H: 'highlight', Qt.Key.Key_P: 'pen',
             Qt.Key.Key_L: 'line',      Qt.Key.Key_A: 'arrow',
             Qt.Key.Key_R: 'rect',      Qt.Key.Key_C: 'circle',
