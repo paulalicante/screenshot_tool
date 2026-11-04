@@ -68,6 +68,28 @@ def _install_python_package(package_name: str) -> bool:
     return True
 
 
+def _prefer_system_cpp_runtime():
+    """Load Windows' own C++ runtime before Qt does.
+
+    PyQt6 ships msvcp140.dll 14.26 (2020). The offline speech engine (ctranslate2, voice
+    notes) is built against a newer one and crashes with an access violation when the old
+    copy is already loaded. Windows reuses a DLL that is already loaded by name, so loading
+    System32's newer copy first makes Qt and the speech engine share it. Qt runs fine on
+    the newer runtime; this costs a few milliseconds."""
+    if sys.platform != 'win32':
+        return
+    sysdir = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')
+    for name in ('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll'):
+        path = os.path.join(sysdir, name)
+        if os.path.exists(path):
+            try:
+                ctypes.WinDLL(path)
+            except OSError:
+                pass
+
+
+_prefer_system_cpp_runtime()
+
 try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -2549,6 +2571,403 @@ class StyledDialog(QDialog):
 
 
 # ============================================================================
+# VOICE NOTE — speak or type a note; speech is turned into text on this PC
+# ============================================================================
+
+# Offline Whisper (faster-whisper). The model is downloaded once into WHISPER_DIR and
+# loaded on first use; nothing is sent anywhere.
+WHISPER_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "OtterlyScreenshots" / "whisper"
+WHISPER_MODEL = "base"
+WHISPER_RATE = 16000            # Whisper listens at 16 kHz mono
+
+
+class _Whisper:
+    """The speech model, loaded once and kept for the life of the app."""
+    _model = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def ready(cls) -> bool:
+        return cls._model is not None
+
+    @classmethod
+    def model(cls):
+        with cls._lock:
+            if cls._model is None:
+                from faster_whisper import WhisperModel
+                WHISPER_DIR.mkdir(parents=True, exist_ok=True)
+                cls._model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8",
+                                          download_root=str(WHISPER_DIR))
+            return cls._model
+
+    @classmethod
+    def transcribe(cls, audio) -> str:
+        """float32 mono 16 kHz samples -> text. The voice filter drops silence, so a quiet
+        recording gives "" rather than an invented sentence."""
+        model = cls.model()
+        with cls._lock:
+            segments, _info = model.transcribe(audio, vad_filter=True, beam_size=5)
+            return " ".join(s.text.strip() for s in segments).strip()
+
+
+_LIVE_WORKERS = set()      # keep running workers alive until they finish
+
+
+class _SpeechWorker(QThread):
+    """Loads the model (audio=None) or turns one recording into text, off the UI thread."""
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, audio=None):
+        super().__init__()
+        self.audio = audio
+        _LIVE_WORKERS.add(self)
+        self.finished.connect(lambda: _LIVE_WORKERS.discard(self))
+
+    def run(self):
+        try:
+            if self.audio is None:
+                _Whisper.model()
+                self.done.emit("")
+            else:
+                self.done.emit(_Whisper.transcribe(self.audio))
+        except Exception as e:
+            logging.error(f"Voice note speech engine failed: {e}")
+            self.failed.emit(str(e))
+
+
+class _MicRecorder:
+    """Records the default microphone with Qt Multimedia; stop() returns 16 kHz mono float32."""
+
+    def __init__(self):
+        self._src = None
+        self._io = None
+        self._buf = bytearray()
+        self.level = 0.0            # loudness of the latest chunk, 0..1
+
+    def start(self):
+        """Start listening; returns None, or why it could not."""
+        try:
+            from PyQt6.QtMultimedia import QAudioSource, QMediaDevices, QAudioFormat
+        except Exception as e:
+            return f"Qt Multimedia is not available ({e})"
+        dev = QMediaDevices.defaultAudioInput()
+        if dev.isNull():
+            return "No microphone found"
+        fmt = QAudioFormat()
+        fmt.setSampleRate(WHISPER_RATE)
+        fmt.setChannelCount(1)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        if not dev.isFormatSupported(fmt):
+            fmt = dev.preferredFormat()
+        self._fmt = fmt
+        self._buf = bytearray()
+        self.level = 0.0
+        self._src = QAudioSource(dev, fmt)
+        self._io = self._src.start()
+        if self._io is None:
+            self._src = None
+            return "The microphone could not be opened"
+        self._io.readyRead.connect(self._read)
+        return None
+
+    @property
+    def active(self) -> bool:
+        return self._src is not None
+
+    def _samples(self, data: bytes):
+        import numpy as np
+        from PyQt6.QtMultimedia import QAudioFormat
+        SF = QAudioFormat.SampleFormat
+        sf = self._fmt.sampleFormat()
+        if sf == SF.Int16:
+            a = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+        elif sf == SF.Int32:
+            a = np.frombuffer(data, dtype="<i4").astype(np.float32) / 2147483648.0
+        elif sf == SF.Float:
+            a = np.frombuffer(data, dtype="<f4").astype(np.float32)
+        else:   # UInt8
+            a = (np.frombuffer(data, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        ch = max(1, self._fmt.channelCount())
+        if ch > 1:
+            a = a[: len(a) - len(a) % ch].reshape(-1, ch).mean(axis=1)
+        return a
+
+    def _read(self):
+        if self._io is None:
+            return
+        data = self._io.readAll().data()
+        if not data:
+            return
+        self._buf += data
+        try:
+            import numpy as np
+            frame = max(1, self._fmt.bytesPerFrame())
+            a = self._samples(bytes(data[: len(data) - len(data) % frame]))
+            if len(a):
+                self.level = float(min(1.0, np.sqrt(np.mean(a * a)) * 6))
+        except Exception:
+            pass
+
+    def seconds(self) -> float:
+        if not self._buf:
+            return 0.0
+        return len(self._buf) / max(1, self._fmt.bytesPerFrame()) / max(1, self._fmt.sampleRate())
+
+    def stop(self):
+        """Stop listening; returns the recording as 16 kHz mono float32 (empty if nothing)."""
+        import numpy as np
+        if self._src is not None:
+            self._read()
+            self._src.stop()
+        self._src = None
+        self._io = None
+        frame = max(1, self._fmt.bytesPerFrame())
+        data = bytes(self._buf[: len(self._buf) - len(self._buf) % frame])
+        self._buf = bytearray()
+        if not data:
+            return np.zeros(0, dtype=np.float32)
+        a = self._samples(data)
+        rate = self._fmt.sampleRate()
+        if rate != WHISPER_RATE and len(a) > 1:
+            n = int(len(a) * WHISPER_RATE / rate)
+            a = np.interp(np.linspace(0, len(a) - 1, n), np.arange(len(a)), a).astype(np.float32)
+        return a
+
+
+class VoiceNoteDialog(QDialog):
+    """Speak or type a note. It starts listening when it opens; Stop turns the speech into
+    text with offline Whisper and adds it to the box, where it can be corrected."""
+
+    DEFAULT_SIZE = 12
+    MAX_SECONDS = 300            # a recording stops by itself after five minutes
+
+    def __init__(self, parent=None, size: int = DEFAULT_SIZE, auto_record: bool = True):
+        from PyQt6.QtWidgets import QPlainTextEdit, QProgressBar
+        super().__init__(parent)
+        self.setWindowTitle("Otterly — Voice note")
+        self.setStyleSheet("""
+            QDialog, QWidget { background:#f0f0f0; color:#222222; }
+            QPlainTextEdit { background:white; border:1px solid #bbbbbb; border-radius:6px;
+                             padding:6px; font-size:12pt; }
+            QPushButton { background:#e8e8e8; border:1px solid #bbbbbb; border-radius:6px;
+                          padding:6px 14px; font-size:10pt; }
+            QPushButton:hover { background:#d0d0d0; border-color:#888888; }
+            QPushButton:disabled { color:#999999; }
+            QSpinBox { background:white; border:1px solid #bbbbbb; border-radius:4px; padding:2px 4px; }
+            QProgressBar { background:#dddddd; border:none; border-radius:3px; }
+            QProgressBar::chunk { background:#2AA198; border-radius:3px; }
+        """)
+        self._auto_record = auto_record
+        self._opened = False
+        self._rec = _MicRecorder()
+        self._busy = False            # a recording is being turned into text
+        self._accept_after = False    # Add was pressed while listening
+        self._engine_error = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        top = QHBoxLayout()
+        self.status_lbl = QLabel("Speak or type your note.")
+        self.status_lbl.setStyleSheet("color:#555; font-size:9pt; background:transparent;")
+        top.addWidget(self.status_lbl, 1)
+        self.level_bar = QProgressBar()
+        self.level_bar.setRange(0, 100)
+        self.level_bar.setTextVisible(False)
+        self.level_bar.setFixedSize(120, 8)
+        self.level_bar.setToolTip("Microphone level")
+        top.addWidget(self.level_bar)
+        lay.addLayout(top)
+
+        self.edit = QPlainTextEdit()
+        self.edit.setMinimumSize(600, 220)      # 255+ characters show without scrolling
+        self.edit.setPlaceholderText("Your note…")
+        self.edit.textChanged.connect(self._count)
+        lay.addWidget(self.edit)
+
+        row = QHBoxLayout()
+        self._mic_icon = QIcon(ScreenshotEditor._make_icon_mic())
+        self.mic_btn = QPushButton()
+        self.mic_btn.setIconSize(QSize(20, 20))
+        self.mic_btn.clicked.connect(self._toggle)
+        row.addWidget(self.mic_btn)
+        size_lbl = QLabel("Size")
+        size_lbl.setStyleSheet("background:transparent; margin-left:10px;")
+        row.addWidget(size_lbl)
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(6, 72)
+        self.size_spin.setValue(size)
+        row.addWidget(self.size_spin)
+        self.count_lbl = QLabel("0 characters")
+        self.count_lbl.setStyleSheet("color:#777; background:transparent; margin-left:10px;")
+        row.addWidget(self.count_lbl)
+        row.addStretch()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(cancel)
+        self.add_btn = QPushButton("Add to picture")
+        self.add_btn.setStyleSheet("QPushButton{background:#2AA198;color:white;border:none;}"
+                                   "QPushButton:hover{background:#33c4bb;}")
+        self.add_btn.setToolTip("Add the note to the picture  [Ctrl+Enter]")
+        self.add_btn.clicked.connect(self._add)
+        row.addWidget(self.add_btn)
+        lay.addLayout(row)
+        # Enter makes a new line in the note; Ctrl+Enter adds it
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        for keys in ("Ctrl+Return", "Ctrl+Enter"):
+            QShortcut(QKeySequence(keys), self, activated=self._add)
+
+        self._tick = QTimer(self)
+        self._tick.setInterval(150)
+        self._tick.timeout.connect(self._on_tick)
+        self._show_button()
+
+    # ── state ────────────────────────────────────────────────────────────────
+
+    def _show_button(self):
+        if self._rec.active:
+            self.mic_btn.setIcon(QIcon())
+            self.mic_btn.setText("■  Stop")
+            self.mic_btn.setStyleSheet("QPushButton{background:#DC322F;color:white;border:none;}"
+                                       "QPushButton:hover{background:#e85552;}")
+            self.mic_btn.setToolTip("Stop listening and write down what you said")
+        else:
+            self.mic_btn.setIcon(self._mic_icon)
+            self.mic_btn.setText(" Speak" if not self.edit.toPlainText().strip() else " Speak more")
+            self.mic_btn.setStyleSheet("")
+            self.mic_btn.setToolTip("Start listening to the microphone")
+        self.mic_btn.setEnabled(not self._busy)
+
+    def _status(self, text: str, color: str = "#555"):
+        self.status_lbl.setText(text)
+        self.status_lbl.setStyleSheet(f"color:{color}; font-size:9pt; background:transparent;")
+
+    def _count(self):
+        n = len(self.edit.toPlainText())
+        self.count_lbl.setText(f"{n} character" + ("" if n == 1 else "s"))
+        if not self._rec.active:
+            self._show_button()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.edit.setFocus()
+        if self._opened:
+            return
+        self._opened = True
+        if not _Whisper.ready():
+            w = _SpeechWorker(None)            # get the model loaded while you talk
+            w.failed.connect(self._engine_failed)
+            w.start()
+        if self._auto_record:
+            QTimer.singleShot(0, self._start)
+
+    def _engine_failed(self, err: str):
+        self._engine_error = err
+        if not self._rec.active and not self._busy:
+            self._status("Voice typing is not available — you can still type.  "
+                         f"({err[:90]})", "#DC322F")
+
+    # ── listening ────────────────────────────────────────────────────────────
+
+    def _toggle(self):
+        if self._rec.active:
+            self._stop()
+        else:
+            self._start()
+
+    def _start(self):
+        if self._rec.active or self._busy:
+            return
+        err = self._rec.start()
+        if err:
+            self._status(f"{err} — you can still type.", "#DC322F")
+            self._show_button()
+            return
+        self._tick.start()
+        self._on_tick()
+        self._show_button()
+
+    def _on_tick(self):
+        if not self._rec.active:
+            return
+        secs = self._rec.seconds()
+        self.level_bar.setValue(int(self._rec.level * 100))
+        self._status(f"● Listening…  {int(secs) // 60}:{int(secs) % 60:02d}   — press Stop when you are done",
+                     "#DC322F")
+        if secs >= self.MAX_SECONDS:
+            self._stop()
+
+    def _stop(self):
+        if not self._rec.active:
+            return
+        self._tick.stop()
+        audio = self._rec.stop()
+        self.level_bar.setValue(0)
+        if len(audio) < WHISPER_RATE * 0.3:
+            self._status("Nothing was recorded — press Speak to try again.", "#555")
+            self._show_button()
+            self._finish_pending_add()
+            return
+        self._busy = True
+        self._status("Writing down what you said…" if _Whisper.ready()
+                     else "Getting the speech engine ready, then writing it down…", "#2AA198")
+        self._show_button()
+        w = _SpeechWorker(audio)
+        w.done.connect(self._heard)
+        w.failed.connect(self._heard_failed)
+        w.start()
+
+    def _heard(self, text: str):
+        self._busy = False
+        if text:
+            cur = self.edit.toPlainText()
+            sep = "" if not cur or cur[-1].isspace() else " "
+            from PyQt6.QtGui import QTextCursor
+            self.edit.moveCursor(QTextCursor.MoveOperation.End)
+            self.edit.insertPlainText(sep + text)
+            self._status("Done — correct it if you need to, Speak more, or Add to picture.", "#555")
+        else:
+            self._status("No speech was heard — press Speak to try again.", "#555")
+        self._show_button()
+        self._finish_pending_add()
+
+    def _heard_failed(self, err: str):
+        self._busy = False
+        self._status(f"Could not turn the speech into text ({err[:90]}) — you can still type.", "#DC322F")
+        self._show_button()
+        self._accept_after = False
+
+    # ── closing ──────────────────────────────────────────────────────────────
+
+    def _add(self):
+        if self._rec.active or self._busy:
+            # finish writing down what was said first, then add the note
+            self._accept_after = True
+            self._stop()
+            return
+        self.accept()
+
+    def _finish_pending_add(self):
+        if self._accept_after:
+            self._accept_after = False
+            self.accept()
+
+    def done(self, r):
+        self._tick.stop()
+        if self._rec.active:
+            self._rec.stop()           # Cancel / Esc while listening: drop the recording
+        super().done(r)
+
+    def text(self) -> str:
+        return self.edit.toPlainText()
+
+    def size_value(self) -> int:
+        return self.size_spin.value()
+
+
+# ============================================================================
 # SCREENSHOT EDITOR
 # ============================================================================
 
@@ -2565,6 +2984,13 @@ class ScreenshotEditor(QMainWindow):
         'red':    QColor(220, 40, 40, 200),
         'white':  QColor(255, 255, 255, 230),
     }
+
+    # How a voice note is laid out: wrapped at word breaks, never clipped
+    NOTE_FLAGS = (Qt.TextFlag.TextWordWrap.value | Qt.TextFlag.TextDontClip.value |
+                  Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignTop.value)
+    NOTE_LINE_CHARS = 64     # a note's box is this many characters wide: 255 fit in 4 lines
+    NOTE_PAD = 8             # plate margin round a note's text
+    NOTE_PLATE = QColor(20, 20, 20, 200)   # the measurement labels' dark plate
 
     def __init__(self, pixmap: QPixmap):
         super().__init__()
@@ -2703,6 +3129,13 @@ class ScreenshotEditor(QMainWindow):
             btn.clicked.connect(lambda chk, m=mode: self._set_mode(m))
             tb.addWidget(btn)
             self._tool_btns[mode] = btn
+            if mode == 'text':
+                # Voice note: an action, not a tool — opens a box to speak or type into
+                self._mic_btn = _icon_btn(self._make_icon_mic(),
+                                          '🎤 Voice note — speak or type a note, then drag it into place',
+                                          checkable=False)
+                self._mic_btn.clicked.connect(self._voice_note)
+                tb.addWidget(self._mic_btn)
         self._tool_btns['highlight'].setChecked(True)
 
         # Aspect ratio lock for measure_rect (right-click the button for menu)
@@ -2861,6 +3294,20 @@ class ScreenshotEditor(QMainWindow):
         p = QPainter(px)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         return px, p
+
+    @staticmethod
+    def _make_icon_mic():
+        px, p = ScreenshotEditor._blank_icon()
+        col = QColor(40, 40, 40)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(col)
+        p.drawRoundedRect(QRectF(12, 2, 10, 18), 5, 5)            # capsule
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(col, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawArc(QRectF(7.5, 7, 19, 17), 180 * 16, 180 * 16)     # cradle
+        p.drawLine(QPoint(17, 24), QPoint(17, 30))
+        p.drawLine(QPoint(11, 31), QPoint(23, 31))
+        p.end(); return px
 
     def _make_icon_move(self):
         px, p = self._blank_icon()
@@ -3281,6 +3728,41 @@ class ScreenshotEditor(QMainWindow):
         font.setBold(True)
         return font
 
+    def _make_note(self, text: str, size: int) -> dict:
+        """A voice note: text wrapped in a box NOTE_LINE_CHARS wide, centred on the picture."""
+        c = self.current_color
+        img = self.original_pixmap.size()
+        p = QPainter(self.overlay_pixmap)
+        p.setFont(self._text_font(size))
+        fm = p.fontMetrics()
+        width = max(120, min(fm.averageCharWidth() * self.NOTE_LINE_CHARS, img.width() - 40))
+        box = fm.boundingRect(QRect(0, 0, width, 1_000_000), self.NOTE_FLAGS, text)
+        p.end()
+        pad = self.NOTE_PAD
+        w, h = box.width() + 2 * pad, box.height() + 2 * pad
+        plate = QRect(max(0, (img.width() - w) // 2), max(0, (img.height() - h) // 2), w, h)
+        return {'kind': 'text', 'pos': plate.topLeft() + QPoint(pad, pad), 'text': text,
+                'size': size, 'width': width, 'color': QColor(c.red(), c.green(), c.blue()),
+                'bbox': plate}
+
+    def _voice_note(self):
+        """Open the voice note box; the note lands in the middle of the picture,
+        selected, with the Move tool on, ready to be dragged into place."""
+        if self.drawing or self._drag:
+            return
+        dlg = VoiceNoteDialog(self, size=VoiceNoteDialog.DEFAULT_SIZE)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        text = dlg.text().strip()
+        if not text:
+            return
+        obj = self._make_note(text, dlg.size_value())
+        self._add_object(obj)
+        self._render_overlay()
+        self._set_mode('move')
+        self._selected = obj
+        self._update_canvas()
+
     def _paint_object(self, p: QPainter, o: dict):
         """Paint one annotation at its current place (its stored geometry + dx/dy)."""
         k = o['kind']
@@ -3327,7 +3809,16 @@ class ScreenshotEditor(QMainWindow):
         elif k == 'text':
             p.setPen(o['color'])
             p.setFont(self._text_font(o['size']))
-            p.drawText(o['pos'], o['text'])
+            if o.get('width'):      # a voice note: wrapped on a dark plate, pos = text top-left
+                p.save()
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(self.NOTE_PLATE)
+                p.drawRoundedRect(o['bbox'], 6, 6)
+                p.restore()
+                p.drawText(QRect(o['pos'], QSize(o['width'], o['bbox'].height())),
+                           self.NOTE_FLAGS, o['text'])
+            else:
+                p.drawText(o['pos'], o['text'])
         elif k == 'measure_line':
             self._draw_measure_line_preview(p, o['a'], o['b'])
         elif k == 'measure_rect':

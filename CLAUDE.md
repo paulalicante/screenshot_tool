@@ -213,6 +213,45 @@ measure line/rect), each with its own colour, size and geometry plus a `dx`/`dy`
   undo/delete/Ctrl+drag/picking/edges/hover), run offscreen and on the Windows platform; functest2.py
   still 53/53. Backup: `screenshot_tool_pyqt.py.bak_pre_move_objects_2026_11_03`.
 
+## Voice note (2026-11-04)
+
+Paul: *"a microphone as an icon on the main menu, and when I click that ... a text box that I can voice
+type into ... default size 12 ... placed anywhere I want, selectable and movable ... at least 255
+characters."* The 🎤 button sits on the editor toolbar right after T (an action, not a tool).
+- `VoiceNoteDialog`: a 600x220 box (255+ characters show without scrolling), a character count, a
+  size box starting at 12, Speak/Stop and "Add to picture" (Ctrl+Enter; Enter is a new line).
+- **Speech is turned into text on this PC by offline Whisper** (faster-whisper 1.2.1, model `base`,
+  int8, CPU). Paul tried Windows voice typing (Win+H) first; it did not work for him and he called it
+  a cheat, so it is gone. The box starts listening when it opens (`_MicRecorder`: Qt Multimedia's
+  `QAudioSource` on the default microphone, 16 kHz mono Int16, else the mic's own format resampled);
+  Stop hands the recording to `_SpeechWorker` (a QThread) and the text is added at the end of the box,
+  where it can be corrected; Speak more adds another piece. Add while listening writes it down first,
+  then adds. Cancel drops a recording. A level bar shows the mic is heard; 5 minutes stops by itself.
+  `vad_filter=True`: silence and room noise give no text. Measured: ~5 s to write down 11 s of speech;
+  the model loads in ~1.5 s (warmed up in the background when the box opens, kept for the session).
+- Model files: `%LOCALAPPDATA%\OtterlyScreenshots\whisper` (142 MB, downloaded 2026-11-04). Packages:
+  faster-whisper and its 20-odd dependencies (84 MB) installed into `.venv`. Imported only when a
+  voice note is used, so startup is untouched. Without them the box says voice typing is not
+  available and typing still works.
+- **The C++ runtime clash (fixed at the top of the file, `_prefer_system_cpp_runtime`)**: PyQt6 ships
+  msvcp140.dll 14.26; ctranslate2 needs a newer one and crashed (access violation in WhisperModel)
+  whenever Qt was loaded first. System32's msvcp140 (14.44) is now loaded before PyQt6, so both share it.
+- The note becomes a `'text'` object with a `width`: wrapped at word breaks inside a box 64 average
+  characters wide (`NOTE_LINE_CHARS`; narrower on small pictures), in the current colour on the
+  measurement labels' dark plate (`NOTE_PLATE`, `NOTE_PAD` 8). Its `bbox` is the plate, so moving,
+  picking, Delete and undo all work as for every other object. It lands in the middle of the picture,
+  selected, with the Move tool on.
+- Proof: speechtest.py (scratchpad: two sentences spoken by Windows text-to-speech come back word for
+  word; the box's whole flow with a stand-in mic; `--mic` records 2 s of the real mic in memory),
+  notetest.py, movetest.py and functest2.py all pass. Backups:
+  `screenshot_tool_pyqt.py.bak_pre_voice_note_2026_11_04`, `...bak_pre_whisper_2026_11_04`.
+
+## Restarting the app (read before killing it)
+`OtterlyScreenshots.vbs` waits on the hidden pythonw copy, and if that copy exits with a code other
+than 0 (a kill) it opens a visible `cmd /k python.exe` copy as a crash fallback. So stop the waiting
+`wscript.exe` (command line ends `OtterlyScreenshots.vbs`) first, then both pythonw processes, then
+start `wscript.exe "...\OtterlyScreenshots.vbs"`. Check one wscript + two pythonw remain.
+
 ## Recent Updates
 - 2026-03-08: Improved gallery responsiveness for delete/save flows in `screenshot_tool_pyqt.py`.
 - Delete now removes thumbnail widgets incrementally (no full gallery rebuild for a single delete).
