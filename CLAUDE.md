@@ -267,11 +267,82 @@ to open with that one, leaving the old one the way it was."*
   three editors, same-size and full-screen captures, cancel, edit-before-save), movetest, notetest
   and speechtest all pass. Backup: `screenshot_tool_pyqt.py.bak_pre_many_editors_2026_11_04`.
 
+## Live voice typing in any text box (2026-11-04)
+
+Paul: *"any text box where I would normally type, I should be able to also use voice typing ...
+right now I'm using voice in Claude directly using the Claude microphone, and it's instant ... showing
+while I'm talking what I'm saying ... that's really what I would like."* He chose offline.
+- **Ctrl+Shift+Space** anywhere starts listening, and again stops it (or ■ Stop on the strip; it also
+  stops by itself after `LIVE_QUIET_STOP` 30 s with nothing said). Registered in `_register_hotkeys`
+  beside the capture keys; the keyboard hook's callback emits `MainWindow.live_typing_requested`,
+  a signal, so the work happens on the UI thread. Not suppressed: the app under the cursor sees the
+  keys too (Word: a non-breaking space).
+- **Engine**: sherpa-onnx (pip `sherpa-onnx` 2.0.1, cp314 wheel) running NVIDIA's streaming
+  FastConformer, `LIVE_ASR` = the 480 ms int8 model, English only. Measured on this Ryzen 5 2600X with
+  the PC 65% busy (TWS, IB Gateway, browsers): 480 ms needs ~20% of a real-time second, the 80 ms model
+  51-64% (it fell behind in the app), Nemotron 0.6B 300-400% (cannot keep up), Kroko 7% but updates
+  only every 1.3 s. decode releases the GIL (the UI ran at 96% speed during non-stop decoding).
+- **Punctuation**: `sherpa-onnx-online-punct-en-2024-08-06` (CNN-BiLSTM, ~25 ms a phrase) puts
+  capitals and marks in. `_LivePhrases` punctuates each phrase together with up to 30 earlier words
+  and types only the mark the previous word gains, then the new words; a phrase's own last mark is
+  held back (the model ends every lone phrase: "Can you send me the report?" + "by Tuesday?") and
+  decided by the next phrase or by Stop (`ending()` asks the model with "thank you" after it, which
+  reliably gives ? or .). Nothing already typed is ever changed.
+- **Typing**: `_send_text` = SendInput with KEYEVENTF_UNICODE, so it works in any layout and never
+  touches the clipboard. It waits while Shift/Ctrl/Alt/Win are held (they would make shortcuts),
+  at most 3 s. A phrase is typed when the engine sees `LIVE_PAUSE` 0.8 s of quiet after speech.
+- **Strip** (`LiveTypingStrip`): frameless, Tool, on top, `WindowDoesNotAcceptFocus` +
+  `WA_ShowWithoutActivating` = WS_EX_NOACTIVATE, so it never takes the keyboard (checked on the real
+  screen, Stop button included). Placed under the text cursor (`GetGUIThreadInfo`; browsers keep
+  theirs private, so then the mouse). Hidden during a capture and shown again after.
+- **The second listen (same day).** Paul: *"pretty good ... not perfectly happy"* — the live model
+  typed "Forgotten, but naught gone". It decides each word within half a second, with no sentence
+  context. Now every finished phrase is heard again, whole, by **NVIDIA Parakeet TDT 0.6B v2**
+  (`LIVE_RECHECK`, int8, 482 MB, offline transducer) and ITS text is typed. Chosen by Paul's own voice
+  test (`voice_test.py` in this folder: live model vs Parakeet v2 vs v3 vs Whisper, side by side,
+  nothing saved) — "Parakeet v2 best". Computer voices never reproduced "naught"; on 16 TTS clips
+  Parakeet fixed "for"→"four" and a dropped "I" but writes "two fifteen" as "$2.15" and "S and P" as
+  "SNP". The live words still show in the strip while you talk; a phrase being checked shows in grey
+  italics, then is typed. The second listen runs on its own thread (`_LiveWorker._recheck_loop`), in
+  order, so the strip keeps flowing. Cost measured on this PC (busy): a 3 s phrase ~0.6 s, an 8 s one
+  1.5-2.5 s, on top of the 0.8 s pause. 6 threads (90th percentile 1.2 s against 2.3 s with 4).
+- Joining phrases (`_LivePhrases.take_heard`): Parakeet's words and punctuation are kept; the
+  punctuation model (with the 30 words before) decides only whether a sentence ends between phrases,
+  and so the first word's capital; Parakeet's own last mark is held back and used at the end (or
+  between sentences when both agree a sentence ended — it hears a question in the voice). A glued
+  currency sign gets its space (`_tidy_heard`). If Parakeet fails or hears nothing, the live words
+  are typed (never lose words). `_ends_sentence()` exists because `"" in ".?!"` is True.
+- The three models (~0.9 GB in memory) are let go `LIVE_FREE_AFTER` (15 min) after voice typing
+  ends; the next use reloads them (about 10 s; the sound is kept meanwhile, nothing is lost).
+- **Models** live in `%LOCALAPPDATA%\OtterlyScreenshots\sherpa` (~650 MB); a PC without them
+  downloads them from the sherpa-onnx GitHub releases on first use, progress in the strip. The
+  archive is unpacked to `realpath(tmp)`: under Claude's package the safety check otherwise refuses.
+- Proof: livetest.py (scratchpad: two TTS sentences streamed in real time through a stand-in mic,
+  100% of the words, two sentences with capitals and full stops, first sentence typed ~1.5 s after
+  its last word; held keys, quiet stop, no mic, quitting mid-sentence, the download; never a real
+  keystroke; the second listen, its failure, letting go and reloading), functest3.py section 10,
+  movetest, notetest, speechtest all pass. Backups: `screenshot_tool_pyqt.py.bak_pre_live_typing_2026_11_04`,
+  `...bak_pre_parakeet_2026_11_04`.
+
+## Claude's desktop app keeps its own copy of %LOCALAPPDATA% (read before restarting the app)
+Anything started from a Claude Code session (Bash, PowerShell, Start-Process) runs inside the Claude
+MSIX package: its writes to `%LOCALAPPDATA%` land in
+`C:\Users\Honey\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local`, and it sees that copy
+merged over the real folder. Paul's normal Otterly (started at login) sees only the real folder. On
+2026-11-04 the Whisper and sherpa models had been downloaded into the package copy only; they were
+copied to the real `C:\Users\Honey\AppData\Local\OtterlyScreenshots` with robocopy run through
+`Invoke-CimMethod Win32_Process Create`, which starts a process OUTSIDE the package. Use the same to
+look at the real folder (`dir`) and to restart Otterly.
+
 ## Restarting the app (read before killing it)
 `OtterlyScreenshots.vbs` waits on the hidden pythonw copy, and if that copy exits with a code other
 than 0 (a kill) it opens a visible `cmd /k python.exe` copy as a crash fallback. So stop the waiting
 `wscript.exe` (command line ends `OtterlyScreenshots.vbs`) first, then both pythonw processes, then
-start `wscript.exe "...\OtterlyScreenshots.vbs"`. Check one wscript + two pythonw remain.
+start it with `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments
+@{CommandLine='wscript.exe "G:\My Drive\MyProjects\screenshot_tool\OtterlyScreenshots.vbs"'}` (not
+Start-Process: that keeps it inside Claude's package, see above). Check one wscript + two pythonw
+remain. First look for open editor windows ("Otterly — Edit Screenshot"): a restart loses their
+unsaved drawing.
 
 ## Recent Updates
 - 2026-03-08: Improved gallery responsiveness for delete/save flows in `screenshot_tool_pyqt.py`.

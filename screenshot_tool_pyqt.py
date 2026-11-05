@@ -102,7 +102,7 @@ try:
     )
     from PyQt6.QtCore import (
         Qt, QPoint, QTimer, QSize, QRect, QRectF, QThread, pyqtSignal,
-        QMimeData, QUrl, QPropertyAnimation, QEasingCurve
+        QMimeData, QUrl, QPropertyAnimation, QEasingCurve, QObject
     )
     from PyQt6.QtGui import (
         QFont, QMouseEvent, QPixmap, QImage, QPainter, QPen, QBrush,
@@ -2639,11 +2639,15 @@ class _SpeechWorker(QThread):
 class _MicRecorder:
     """Records the default microphone with Qt Multimedia; stop() returns 16 kHz mono float32."""
 
-    def __init__(self):
+    def __init__(self, on_chunk=None):
         self._src = None
         self._io = None
         self._buf = bytearray()
         self.level = 0.0            # loudness of the latest chunk, 0..1
+        # Live voice typing hands each piece of sound on as it arrives, (float32 samples, rate),
+        # instead of keeping the whole recording.
+        self._on_chunk = on_chunk
+        self._rest = b""
 
     def start(self):
         """Start listening; returns None, or why it could not."""
@@ -2698,6 +2702,23 @@ class _MicRecorder:
             return
         data = self._io.readAll().data()
         if not data:
+            return
+        if self._on_chunk is not None:
+            frame = max(1, self._fmt.bytesPerFrame())
+            data = self._rest + data
+            cut = len(data) - len(data) % frame
+            self._rest = data[cut:]
+            data = data[:cut]
+            if not data:
+                return
+            try:
+                a = self._samples(data)
+                if len(a):
+                    import numpy as np
+                    self.level = float(min(1.0, np.sqrt(np.mean(a * a)) * 6))
+                    self._on_chunk(a, self._fmt.sampleRate())
+            except Exception as e:
+                logging.error(f"Live voice typing: microphone chunk failed: {e}")
             return
         self._buf += data
         try:
@@ -2965,6 +2986,804 @@ class VoiceNoteDialog(QDialog):
 
     def size_value(self) -> int:
         return self.size_spin.value()
+
+
+# ============================================================================
+# LIVE VOICE TYPING — speak into any text box; the words show while you talk
+# ============================================================================
+# Ctrl+Shift+Space anywhere starts listening, and again stops it. A streaming speech engine
+# (sherpa-onnx running NVIDIA's FastConformer, 480 ms steps) shows the words in a strip by the cursor
+# as you speak. When you pause, a larger model (NVIDIA Parakeet TDT 0.6B v2) listens to that whole
+# phrase again and its text, with capitals and punctuation, is typed into the text box that has the
+# cursor. A small punctuation model joins the phrases into sentences. All on this PC.
+
+LIVE_DIR = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "OtterlyScreenshots" / "sherpa"
+# 480 ms steps, not 80: the 80 ms model needs 51-64% of a real-time second on this PC and falls
+# behind when the PC is busy; this one needs about 20%, and the words show half a second apart.
+LIVE_ASR = "sherpa-onnx-nemo-streaming-fast-conformer-transducer-en-480ms-int8"
+LIVE_PUNCT = "sherpa-onnx-online-punct-en-2024-08-06"
+# The second listen. Paul's own voice test (2026-11-04): it heard him best of the live model,
+# Parakeet v2, Parakeet v3 and Whisper. About 0.6 s a phrase here, more when the PC is busy.
+LIVE_RECHECK = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+_SHERPA_RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
+LIVE_URLS = {
+    LIVE_ASR: f"{_SHERPA_RELEASES}/asr-models/{LIVE_ASR}.tar.bz2",
+    LIVE_PUNCT: f"{_SHERPA_RELEASES}/punctuation-models/{LIVE_PUNCT}.tar.bz2",
+    LIVE_RECHECK: f"{_SHERPA_RELEASES}/asr-models/{LIVE_RECHECK}.tar.bz2",
+}
+LIVE_FILES = {
+    LIVE_ASR: ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"),
+    LIVE_PUNCT: ("model.int8.onnx", "bpe.vocab"),
+    LIVE_RECHECK: ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"),
+}
+_LIVE_LABELS = {LIVE_ASR: "live speech model", LIVE_PUNCT: "punctuation model",
+                LIVE_RECHECK: "accurate speech model"}
+LIVE_HOTKEY = "ctrl+shift+space"
+LIVE_HOTKEY_LABEL = "Ctrl+Shift+Space"
+LIVE_QUIET_STOP = 30        # seconds without a word heard: stop listening by itself
+LIVE_PAUSE = 0.8            # seconds of quiet after speech that end a phrase (it is typed then)
+LIVE_CONTEXT_WORDS = 30     # earlier words the punctuation model sees, so a phrase reads on from them
+LIVE_FREE_AFTER = 15 * 60   # seconds of no voice typing before the models are let go (~0.9 GB)
+_LIVE_MARKS = ".?!,;:"
+
+
+class _LiveModels:
+    """The three models: downloaded once (about 620 MB), loaded on first use, let go when idle."""
+    _asr = None
+    _punct = None
+    _recheck = None
+    _lock = threading.Lock()
+    _recheck_lock = threading.Lock()
+    punct_lock = threading.Lock()      # the punctuation model is used from two threads
+
+    @classmethod
+    def on_disk(cls) -> bool:
+        return all((LIVE_DIR / name / f).is_file() for name, files in LIVE_FILES.items() for f in files)
+
+    @classmethod
+    def ready(cls) -> bool:
+        return cls._asr is not None and cls._punct is not None
+
+    @classmethod
+    def unload(cls):
+        with cls._lock, cls._recheck_lock:
+            cls._asr = cls._punct = cls._recheck = None
+
+    @classmethod
+    def _download(cls, name: str, progress=None):
+        import urllib.request
+        import tarfile
+        LIVE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = LIVE_DIR / f"_download_{name}"
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir()
+        archive = tmp / f"{name}.tar.bz2"
+        try:
+            with urllib.request.urlopen(LIVE_URLS[name], timeout=60) as r, open(archive, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
+                done = 0
+                while True:
+                    block = r.read(1 << 20)
+                    if not block:
+                        break
+                    f.write(block)
+                    done += len(block)
+                    if progress:
+                        progress(done, total)
+            with tarfile.open(archive) as t:
+                # realpath: under a packaged parent (Claude's desktop app) AppData is redirected,
+                # and the safety check compares the members' real paths with this one.
+                t.extractall(os.path.realpath(tmp), filter="data")
+            src = tmp / name
+            if not src.is_dir():
+                raise RuntimeError(f"the download of {name} did not hold the model")
+            dst = LIVE_DIR / name
+            if dst.exists():
+                shutil.rmtree(dst, ignore_errors=True)
+            shutil.move(str(src), str(dst))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @classmethod
+    def _ensure(cls, name: str, status=None):
+        if all((LIVE_DIR / name / f).is_file() for f in LIVE_FILES[name]):
+            return
+        label = _LIVE_LABELS[name]
+
+        def _p(done, total):
+            if status:
+                status(f"Downloading the {label} (once): {done / 1e6:.0f} of {total / 1e6:.0f} MB"
+                       if total else f"Downloading the {label}: {done / 1e6:.0f} MB")
+        _p(0, 0)
+        cls._download(name, _p)
+
+    @classmethod
+    def load(cls, status=None):
+        """(live recognizer, punctuation) — downloads what is missing first. status(text) says what it is doing."""
+        with cls._lock:
+            if cls.ready():
+                return cls._asr, cls._punct
+            cls._ensure(LIVE_ASR, status)
+            cls._ensure(LIVE_PUNCT, status)
+            if status:
+                status("Getting ready…")
+            import sherpa_onnx
+            a = LIVE_DIR / LIVE_ASR
+            asr = sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=str(a / "tokens.txt"), encoder=str(a / "encoder.int8.onnx"),
+                decoder=str(a / "decoder.int8.onnx"), joiner=str(a / "joiner.int8.onnx"),
+                num_threads=2, sample_rate=WHISPER_RATE, feature_dim=80, decoding_method="greedy_search",
+                enable_endpoint_detection=True, rule1_min_trailing_silence=2.4,
+                rule2_min_trailing_silence=LIVE_PAUSE, rule3_min_utterance_length=20)
+            p = LIVE_DIR / LIVE_PUNCT
+            punct = sherpa_onnx.OnlinePunctuation(sherpa_onnx.OnlinePunctuationConfig(
+                model_config=sherpa_onnx.OnlinePunctuationModelConfig(
+                    cnn_bilstm=str(p / "model.int8.onnx"), bpe_vocab=str(p / "bpe.vocab"), num_threads=1)))
+            cls._asr, cls._punct = asr, punct
+            return asr, punct
+
+    @classmethod
+    def load_recheck(cls, status=None):
+        """The accurate model that listens to each finished phrase again."""
+        with cls._recheck_lock:
+            if cls._recheck is None:
+                cls._ensure(LIVE_RECHECK, status)
+                import sherpa_onnx
+                d = LIVE_DIR / LIVE_RECHECK
+                cls._recheck = sherpa_onnx.OfflineRecognizer.from_transducer(
+                    encoder=str(d / "encoder.int8.onnx"), decoder=str(d / "decoder.int8.onnx"),
+                    joiner=str(d / "joiner.int8.onnx"), tokens=str(d / "tokens.txt"),
+                    # 6 threads: here the slowest tenth of phrases took 1.2 s against 2.3 s with 4.
+                    num_threads=6, model_type="nemo_transducer", decoding_method="greedy_search")
+            return cls._recheck
+
+    @classmethod
+    def recheck(cls, pieces) -> str:
+        """The phrase's sound, [(samples, rate), ...], heard again in one go."""
+        rec = cls.load_recheck()
+        st = rec.create_stream()
+        for samples, rate in pieces:
+            st.accept_waveform(rate, samples)
+        rec.decode_stream(st)
+        return st.result.text.strip()
+
+
+def _tidy_heard(text: str) -> str:
+    """Small fixes to the accurate model's text: it glues a currency sign to the word before
+    ("at$2.15")."""
+    import re
+    return re.sub(r"(?<=[A-Za-z])(?=[$€£]\d)", " ", text).strip()
+
+
+def _ends_sentence(mark: str) -> bool:
+    return mark[:1] in (".", "?", "!")      # not `in ".?!"`: "" is in every string
+
+
+def _plain_word(tok: str) -> str:
+    return tok.strip(_LIVE_MARKS + "\"'()").lower()
+
+
+class _LivePhrases:
+    """Turns each finished phrase into the text that is typed, read on from what was already typed.
+    A pause can fall in the middle of a sentence, so a phrase is punctuated together with the words
+    before it, and only the mark the earlier word gains (a full stop, a comma) is typed ahead of the
+    new words; nothing already typed is ever changed. For the same reason a phrase's own last mark is
+    held back: the next phrase, or Stop, decides it (every lone phrase gets one: "Can you send me the
+    report?" + "by Tuesday?")."""
+
+    def __init__(self, punct):
+        self.punct = punct
+        self.words: list = []        # every word typed so far, plain
+        self.last_typed = ""         # the last word as it was typed
+        self.held = ""               # the accurate model's own mark at the end of the last phrase
+
+    def _punctuate(self, words: list) -> list:
+        with _LiveModels.punct_lock:
+            return self.punct.add_punctuation_with_case(" ".join(words)).split()
+
+    def render(self, raw: str):
+        """(mark for the word before, the new words) for one phrase, without taking it."""
+        new = raw.split()
+        if not new:
+            return "", ""
+        ctx = self.words[-LIVE_CONTEXT_WORDS:]
+        out = self._punctuate(ctx + new)
+        if len(out) != len(ctx) + len(new):          # never happens in practice; keep it safe
+            return "", " ".join(self._punctuate(new)).rstrip(_LIVE_MARKS)
+        mark = ""
+        if ctx:
+            before = out[len(ctx) - 1]
+            tail = before[len(before.rstrip(_LIVE_MARKS)):]
+            if tail and not self.last_typed.endswith(tail):
+                mark = tail
+        toks = out[len(ctx):]
+        toks[-1] = toks[-1].rstrip(_LIVE_MARKS)
+        if not toks[-1]:
+            toks.pop()
+        return mark, " ".join(toks)
+
+    def take(self, raw: str) -> str:
+        """The text to type for a phrase, from the live model's plain words."""
+        mark, text = self.render(raw)
+        if not text:
+            return ""
+        typed = (mark + " " + text) if self.words else text
+        self.words += raw.split()
+        self.last_typed = text.split()[-1]
+        self.held = ""
+        return typed
+
+    def take_heard(self, heard: str) -> str:
+        """The text to type for a phrase, from the accurate model's own words and punctuation. The
+        punctuation model, which sees the phrases before, decides only where a sentence ends
+        between phrases, and so whether this phrase starts with a capital."""
+        toks = [t for t in _tidy_heard(heard).split() if _plain_word(t)]
+        if not toks:
+            return ""
+        plain = [_plain_word(t) for t in toks]
+        mark, ptext = self.render(" ".join(plain))
+        if self.words and _ends_sentence(mark) and _ends_sentence(self.held):
+            mark = self.held                   # its question mark: it heard the voice go up
+        ptoks = ptext.split()
+        first = toks[0]
+        if self.words and ptoks and _plain_word(ptoks[0]) == plain[0]:
+            starts = ptoks[0][:1].isupper()
+            if starts and first[:1].islower():
+                first = first[:1].upper() + first[1:]
+            elif not starts and first[:1].isupper() and first[1:2].islower():
+                first = first[:1].lower() + first[1:]     # "By Tuesday" after "...the report"
+        toks[0] = first
+        last = toks[-1]
+        self.held = last[len(last.rstrip(_LIVE_MARKS)):]
+        toks[-1] = last.rstrip(_LIVE_MARKS)
+        typed = (mark + " " if self.words else "") + " ".join(toks)
+        self.words += plain
+        self.last_typed = toks[-1]
+        return typed
+
+    def ending(self) -> str:
+        """The full stop or question mark the last sentence needs when you stop."""
+        if not self.words or (self.last_typed[-1:] and self.last_typed[-1:] in _LIVE_MARKS):
+            return ""
+        if _ends_sentence(self.held):
+            return self.held[:1]
+        ctx = self.words[-LIVE_CONTEXT_WORDS:]
+        # A word after it lets the model see that the sentence is over.
+        out = self._punctuate(ctx + ["thank", "you"])
+        if len(out) != len(ctx) + 2:
+            return ""
+        tail = out[len(ctx) - 1][len(out[len(ctx) - 1].rstrip(_LIVE_MARKS)):]
+        return tail if _ends_sentence(tail) else ""
+
+
+class _LiveWorker(QThread):
+    """Feeds the microphone into the live engine, off the UI thread. Each finished phrase goes to a
+    second thread, where the accurate model listens to it again; the live words keep flowing
+    meanwhile, and the phrases are typed in the order they were said."""
+    partial = pyqtSignal(str, str)      # (mark for the word before, words heard so far in this phrase)
+    pending = pyqtSignal(str)           # a finished phrase, as the live model heard it, being checked
+    final = pyqtSignal(str, bool)       # text to type now; True for a phrase, False for the closing mark
+    status = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, recheck: bool = True):
+        super().__init__()
+        import queue
+        self._q = queue.Queue()
+        self._rq = queue.Queue()
+        self._recheck_on = recheck
+        self._abort = False
+        _LIVE_WORKERS.add(self)
+        self.finished.connect(lambda: _LIVE_WORKERS.discard(self))
+
+    def feed(self, samples, rate: int):
+        self._q.put((samples, rate))
+
+    def finish(self):
+        self._q.put(None)
+
+    def abort(self):
+        """The app is quitting: no more listening again, no more typing."""
+        self._abort = True
+        self._q.put(None)
+
+    def _recheck_loop(self, phrases):
+        recheck_ok = self._recheck_on
+        if recheck_ok:
+            try:
+                _LiveModels.load_recheck(self.status.emit)
+            except Exception as e:
+                logging.error(f"Live voice typing: the accurate model could not load, using the live one: {e}")
+                recheck_ok = False
+        while True:
+            item = self._rq.get()
+            if item is None or self._abort:
+                if not self._abort:
+                    end = phrases.ending()
+                    if end:
+                        self.final.emit(end, False)
+                return
+            pieces, raw = item
+            text = None
+            if recheck_ok:
+                try:
+                    text = phrases.take_heard(_LiveModels.recheck(pieces)) or None
+                    if text is None:
+                        logging.error(f"Live voice typing: the accurate model heard nothing in {raw!r}; "
+                                      "typing the live words")
+                except Exception as e:
+                    logging.error(f"Live voice typing: listening again failed, typing the live words: {e}")
+            if text is None:                   # never lose words the live model heard
+                text = phrases.take(raw)
+            if text and not self._abort:
+                self.final.emit(text, True)
+
+    def run(self):
+        import numpy as np
+        import queue
+        try:
+            asr, punct = _LiveModels.load(self.status.emit)
+        except Exception as e:
+            logging.error(f"Live voice typing: the engine could not start: {e}")
+            self.failed.emit(str(e))
+            return
+        self.status.emit("")
+        phrases = _LivePhrases(punct)
+        second = threading.Thread(target=self._recheck_loop, args=(phrases,), daemon=True,
+                                  name="otterly-voice-recheck")
+        second.start()
+        stream = asr.create_stream()
+        shown = ""
+        pieces = []                      # the sound of the phrase being spoken
+        try:
+            while True:
+                # Take everything waiting at once: when the PC is busy and the engine falls behind,
+                # it catches up in one go instead of redrawing every piece.
+                items = [self._q.get()]
+                while True:
+                    try:
+                        items.append(self._q.get_nowait())
+                    except queue.Empty:
+                        break
+                stopping = False
+                for it in items:
+                    if it is None:          # Stop: what came before it is still taken
+                        stopping = True
+                        break
+                    stream.accept_waveform(it[1], it[0])
+                    pieces.append(it)
+                if stopping:
+                    if not self._abort:
+                        # The last words: some quiet lets the engine finish them.
+                        stream.accept_waveform(WHISPER_RATE, np.zeros(int(WHISPER_RATE * 1.0), dtype=np.float32))
+                        stream.input_finished()
+                        while asr.is_ready(stream):
+                            asr.decode_stream(stream)
+                        raw = asr.get_result(stream).strip()
+                        if raw:
+                            self.pending.emit(phrases.render(raw)[1])
+                            self._rq.put((pieces, raw))
+                    self._rq.put(None)
+                    second.join(None if not self._abort else 3.0)
+                    return
+                while asr.is_ready(stream):
+                    asr.decode_stream(stream)
+                raw = asr.get_result(stream).strip()
+                if asr.is_endpoint(stream):
+                    if raw:
+                        self.pending.emit(phrases.render(raw)[1])
+                        self._rq.put((pieces, raw))
+                    pieces = []
+                    asr.reset(stream)
+                    shown = ""
+                    self.partial.emit("", "")
+                elif raw != shown:
+                    shown = raw
+                    mark, text = phrases.render(raw)
+                    self.partial.emit(mark, text)
+        except Exception as e:
+            logging.error(f"Live voice typing: the engine stopped: {e}")
+            self.failed.emit(str(e))
+            self._rq.put(None)
+
+
+# ── typing into whatever window has the cursor ──────────────────────────────
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("u", _INPUTUNION)]
+
+
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+_MODIFIER_KEYS = (0x10, 0x11, 0x12, 0x5B, 0x5C)     # Shift, Ctrl, Alt, both Windows keys
+
+
+def _unicode_inputs(text: str):
+    """Key presses that type `text` as characters, whatever the keyboard layout."""
+    units = text.encode("utf-16-le")
+    codes = [int.from_bytes(units[i:i + 2], "little") for i in range(0, len(units), 2)]
+    arr = (_INPUT * (2 * len(codes)))()
+    for i, c in enumerate(codes):
+        for j, flags in enumerate((_KEYEVENTF_UNICODE, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP)):
+            arr[2 * i + j].type = 1     # INPUT_KEYBOARD
+            arr[2 * i + j].u.ki = _KEYBDINPUT(0, c, flags, 0, 0)
+    return arr
+
+
+def _modifiers_down() -> bool:
+    try:
+        return any(ctypes.windll.user32.GetAsyncKeyState(k) & 0x8000 for k in _MODIFIER_KEYS)
+    except Exception:
+        return False
+
+
+def _send_text(text: str) -> bool:
+    """Type the text into the window that has the keyboard."""
+    if not text:
+        return True
+    arr = _unicode_inputs(text)
+    sent = ctypes.windll.user32.SendInput(len(arr), arr, ctypes.sizeof(_INPUT))
+    return sent == len(arr)
+
+
+def _text_cursor_point():
+    """Where the text cursor is on screen (Qt coordinates), or the mouse if the window keeps it to
+    itself, as browsers do."""
+    try:
+        class _RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class _GUITHREADINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_ulong), ("flags", ctypes.c_ulong),
+                        ("hwndActive", ctypes.c_void_p), ("hwndFocus", ctypes.c_void_p),
+                        ("hwndCapture", ctypes.c_void_p), ("hwndMenuOwner", ctypes.c_void_p),
+                        ("hwndMoveSize", ctypes.c_void_p), ("hwndCaret", ctypes.c_void_p),
+                        ("rcCaret", _RECT)]
+
+        class _POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        u = ctypes.windll.user32
+        u.GetForegroundWindow.restype = ctypes.c_void_p
+        u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        u.ClientToScreen.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        tid = u.GetWindowThreadProcessId(u.GetForegroundWindow(), None)
+        gti = _GUITHREADINFO()
+        gti.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        if tid and u.GetGUIThreadInfo(tid, ctypes.byref(gti)) and gti.hwndCaret:
+            pt = _POINT(gti.rcCaret.left, gti.rcCaret.bottom)
+            if u.ClientToScreen(gti.hwndCaret, ctypes.byref(pt)) and (pt.x or pt.y):
+                scr = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+                g, dpr = scr.geometry(), scr.devicePixelRatio() or 1.0
+                return QPoint(int(g.x() + (pt.x - g.x()) / dpr), int(g.y() + (pt.y - g.y()) / dpr))
+    except Exception:
+        pass
+    return QCursor.pos()
+
+
+class LiveTypingStrip(QWidget):
+    """The small bar that shows what is heard. It never takes the keyboard, so the words go to
+    the text box you were typing in."""
+    stop_clicked = pyqtSignal()
+    TAIL_CHARS = 90
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool |
+                         Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle("Voice typing")
+        self.setFixedWidth(560)
+        self._typed = ""
+        self._checking: list = []        # finished phrases being listened to again
+        self._live = ""
+        self._level = 0.0
+
+        box = QFrame(self)
+        box.setObjectName("liveBox")
+        box.setStyleSheet(
+            "#liveBox { background: rgba(24,26,32,235); border: 1px solid #3a3f4b; border-radius: 10px; }"
+            "QLabel { color: #e8eaf0; background: transparent; }"
+            "QPushButton { color: #e8eaf0; background: #3a3f4b; border: none; border-radius: 6px;"
+            " padding: 3px 10px; font-size: 9pt; } QPushButton:hover { background: #c0392b; }")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(box)
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(12, 8, 8, 8)
+        lay.setSpacing(10)
+        self.dot = QLabel()
+        self.dot.setFixedSize(14, 14)
+        lay.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        self.text_lbl = QLabel()
+        self.text_lbl.setWordWrap(True)
+        self.text_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.text_lbl.setStyleSheet("font-size: 11pt;")
+        self.text_lbl.setMinimumHeight(22)
+        col.addWidget(self.text_lbl)
+        self.hint = QLabel(f"Listening — pause and it types  ·  {LIVE_HOTKEY_LABEL} stops")
+        self.hint.setStyleSheet("color: #8a90a0; font-size: 8pt;")
+        col.addWidget(self.hint)
+        lay.addLayout(col, 1)
+        self.stop_btn = QPushButton("■ Stop")
+        self.stop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_btn.clicked.connect(self.stop_clicked.emit)
+        lay.addWidget(self.stop_btn, 0, Qt.AlignmentFlag.AlignTop)
+        self.set_level(0.0)
+        self.set_status("Listening…")
+
+    def set_level(self, v: float):
+        self._level = v
+        a = int(110 + 145 * min(1.0, v * 1.5))
+        self.dot.setStyleSheet(f"background: rgba(231,76,60,{a}); border-radius: 7px;")
+
+    def set_status(self, text: str):
+        """A grey line in place of the words (getting ready, downloading, finishing)."""
+        import html
+        self.text_lbl.setText(f"<span style='color:#8a90a0'>{html.escape(text)}</span>")
+        self.adjustSize()
+
+    def _show(self, live=None):
+        import html
+        if live is not None:
+            self._live = live
+        live = self._live
+        tail = self._typed[-self.TAIL_CHARS:]
+        if len(self._typed) > self.TAIL_CHARS:
+            tail = "…" + tail[tail.find(" ") + 1:] if " " in tail else "…" + tail
+        parts = []
+        if tail:
+            parts.append(f"<span style='color:#9aa3b5'>{html.escape(tail)}</span>")
+        for c in self._checking:
+            gap = " " if parts else ""
+            parts.append(f"<span style='color:#c8ccd6'><i>{html.escape(gap + c)}</i></span>")
+        if live:
+            if self._checking and not live.startswith(" "):
+                live = " " + live
+            parts.append(f"<span style='color:#ffffff'>{html.escape(live)}</span>")
+        self.text_lbl.setText("".join(parts) if parts else
+                              "<span style='color:#8a90a0'>Listening…</span>")
+        self.adjustSize()
+
+    def set_partial(self, mark: str, words: str):
+        lead = mark + (" " if self._typed and words else "")
+        self._show(lead + words if words else "")
+
+    def add_checking(self, text: str):
+        """A finished phrase, as heard live, while the accurate model listens to it again."""
+        if text:
+            self._checking.append(text)
+            self._show("")
+
+    def add_typed(self, text: str, phrase: bool = True):
+        self._typed += text
+        if phrase and self._checking:
+            self._checking.pop(0)
+        self._show()
+
+    def place_near(self, pt: QPoint):
+        """Just under the text cursor; above it where there is no room below."""
+        scr = QApplication.screenAt(pt) or QApplication.primaryScreen()
+        g = scr.availableGeometry()
+        self.adjustSize()
+        w, h = self.width(), max(self.height(), 56)
+        x = min(max(g.left() + 8, pt.x() - 40), g.right() - w - 8)
+        y = pt.y() + 18
+        if y + h > g.bottom() - 8:
+            y = pt.y() - h - 30
+        self.move(x, max(g.top() + 8, y))
+
+
+class LiveVoiceTyping(QObject):
+    """Ctrl+Shift+Space: listen, show the words live, type each phrase where the cursor is."""
+    stopped = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.strip = None
+        self.worker = None
+        self.rec = None
+        self._pending: list = []         # text waiting for Shift/Ctrl/Alt to be let go
+        self._waited = 0.0
+        self._last_heard = 0.0
+        self._stopping = False
+        self._failed = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._tick)
+        self._type_timer = QTimer(self)
+        self._type_timer.setInterval(40)
+        self._type_timer.timeout.connect(self._flush)
+        # The models take about 0.9 GB: let them go after a while without voice typing.
+        self._free_timer = QTimer(self)
+        self._free_timer.setSingleShot(True)
+        self._free_timer.timeout.connect(self._free_models)
+
+    @property
+    def active(self) -> bool:
+        return self.worker is not None
+
+    def toggle(self):
+        if self.active:
+            self.stop()
+        else:
+            self.start()
+
+    def start(self):
+        if self.active:
+            return
+        self._stopping = False
+        self._failed = False
+        self._pending = []
+        self._free_timer.stop()
+        if self.strip is not None:          # the last session's strip, still fading out
+            self.strip.close()
+            self.strip.deleteLater()
+        self.strip = LiveTypingStrip()
+        self.strip.stop_clicked.connect(self.stop)
+        self.strip.place_near(_text_cursor_point())
+        self.worker = _LiveWorker()
+        self.worker.partial.connect(self._on_partial)
+        self.worker.pending.connect(self._on_checking)
+        self.worker.final.connect(self._on_final)
+        self.worker.status.connect(self._on_status)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self._on_worker_done)
+        self.rec = _MicRecorder(on_chunk=self.worker.feed)
+        err = self.rec.start()
+        if err:
+            self.rec = None
+            self.worker = None
+            self.strip.set_status(f"Voice typing: {err}")
+            self.strip.hint.setText("")
+            self.strip.show()
+            QTimer.singleShot(4000, self._close_strip)
+            return
+        self.worker.start()
+        if not _LiveModels.ready():
+            self.strip.set_status("Getting ready…")
+        self.strip.show()
+        self._last_heard = time.monotonic()
+        self._timer.start()
+
+    def stop(self):
+        if not self.active or self._stopping:
+            return
+        self._stopping = True
+        self._timer.stop()
+        if self.rec is not None:
+            self.rec.stop()
+            self.rec = None
+        if self.strip:
+            self.strip.hint.setText("Finishing the last words…")
+            self.strip.set_level(0.0)
+        self.worker.finish()
+
+    def _tick(self):
+        if self.rec is not None and self.strip:
+            self.strip.set_level(self.rec.level)
+        if time.monotonic() - self._last_heard > LIVE_QUIET_STOP:
+            self.stop()
+
+    def _on_status(self, text: str):
+        self._last_heard = time.monotonic()     # getting ready or downloading is not silence
+        if self.strip:
+            if text:
+                self.strip.set_status(text)
+            else:
+                self.strip.set_partial("", "")
+
+    def _on_partial(self, mark: str, words: str):
+        if words:
+            self._last_heard = time.monotonic()
+        if self.strip:
+            self.strip.set_partial(mark, words)
+
+    def _on_checking(self, text: str):
+        self._last_heard = time.monotonic()
+        if self.strip:
+            self.strip.add_checking(text)
+
+    def _on_final(self, text: str, phrase: bool = True):
+        self._last_heard = time.monotonic()
+        self._pending.append(text)
+        if self.strip:
+            self.strip.add_typed(text, phrase)
+        self._flush()
+
+    def _flush(self):
+        """Type what is waiting, once no Shift/Ctrl/Alt/Windows key is held (they would turn
+        letters into shortcuts). Held for over 3 s: type anyway."""
+        if not self._pending:
+            self._type_timer.stop()
+            return
+        if _modifiers_down() and self._waited < 3.0:
+            self._waited += 0.04
+            if not self._type_timer.isActive():
+                self._type_timer.start()
+            return
+        self._waited = 0.0
+        self._type_timer.stop()
+        text, self._pending = "".join(self._pending), []
+        try:
+            if not _send_text(text):
+                logging.error("Live voice typing: Windows did not take all the typed text")
+        except Exception as e:
+            logging.error(f"Live voice typing: typing failed: {e}")
+
+    def _on_failed(self, msg: str):
+        if self.strip:
+            self.strip.set_status(f"Voice typing could not start: {msg[:120]}")
+        if self.rec is not None:
+            self.rec.stop()
+            self.rec = None
+        self._timer.stop()
+        self._stopping = True
+        self._failed = True
+
+    def _on_worker_done(self):
+        self._flush()
+        self.worker = None
+        self._timer.stop()
+        QTimer.singleShot(6000 if self._failed else (1200 if not self._pending else 3200), self._close_strip)
+        self._free_timer.start(int(LIVE_FREE_AFTER * 1000))
+        self.stopped.emit()
+
+    def _free_models(self):
+        if not self.active:
+            _LiveModels.unload()
+
+    def shutdown(self):
+        """The app is quitting: stop listening, type nothing more, let the engine thread end."""
+        self._timer.stop()
+        self._type_timer.stop()
+        self._pending = []
+        if self.rec is not None:
+            self.rec.stop()
+            self.rec = None
+        self._free_timer.stop()
+        w = self.worker
+        if w is not None:
+            try:
+                w.final.disconnect()
+            except Exception:
+                pass
+            w.abort()
+            w.wait(3000)
+        self._close_strip_now()
+
+    def _close_strip_now(self):
+        if self.strip:
+            self.strip.close()
+            self.strip.deleteLater()
+            self.strip = None
+
+    def _close_strip(self):
+        if self.worker is not None:      # a new session already started with this strip gone
+            return
+        if self.strip:
+            self.strip.close()
+            self.strip.deleteLater()
+            self.strip = None
 
 
 # ============================================================================
@@ -5074,6 +5893,7 @@ class MainWindow(QMainWindow):
 
     screenshot_written = pyqtSignal(str, bool)   # filepath, ok — from the background PNG writer
     edit_written = pyqtSignal(str, bool, int)    # filepath, ok, size change — an editor save written
+    live_typing_requested = pyqtSignal()          # Ctrl+Shift+Space, from the keyboard hook's thread
 
     def __init__(self):
         super().__init__()
@@ -5112,6 +5932,11 @@ class MainWindow(QMainWindow):
         QApplication.instance().aboutToQuit.connect(self._thumb_loader.stop)
         self.screenshot_written.connect(self._on_screenshot_written)
         self.edit_written.connect(self._on_edit_written)
+        # Voice typing into any text box (Ctrl+Shift+Space)
+        self._live_typing = LiveVoiceTyping()
+        self.live_typing_requested.connect(self._live_typing.toggle)
+        QApplication.instance().aboutToQuit.connect(self._live_typing.shutdown)
+        self._live_strip_hidden_for_capture = False
 
         # Coalesce bursts (window drag-resize, typing in search) into one gallery update.
         self._reflow_timer = QTimer(self)
@@ -6514,6 +7339,7 @@ class MainWindow(QMainWindow):
             keyboard.add_hotkey('ctrl+shift+s', self._hotkey_fullscreen)
             keyboard.add_hotkey('ctrl+shift+r', self._hotkey_region)
             keyboard.add_hotkey('ctrl+shift+w', self._hotkey_window)
+            keyboard.add_hotkey(LIVE_HOTKEY, self._hotkey_live_typing)
         except Exception as e:
             logging.error(f"Failed to register hotkeys: {e}")
 
@@ -6532,6 +7358,10 @@ class MainWindow(QMainWindow):
     def _hotkey_window(self):
         """Hotkey callback for window capture"""
         QTimer.singleShot(0, self._start_window_capture)
+
+    def _hotkey_live_typing(self):
+        """Ctrl+Shift+Space: start or stop voice typing (a signal carries it to the UI thread)."""
+        self.live_typing_requested.emit()
 
     def _start_region_capture(self):
         """Start region capture"""
@@ -6617,6 +7447,12 @@ class MainWindow(QMainWindow):
         if self.isVisible():
             self.hide()
 
+        # The voice typing strip stays out of the shot too.
+        strip = getattr(getattr(self, '_live_typing', None), 'strip', None)
+        if strip is not None and strip.isVisible():
+            strip.hide()
+            self._live_strip_hidden_for_capture = True
+
         # Open editors leave the screen for the capture and come back, as they were, after it.
         for ed in self._editors:
             if ed.isVisible() and not ed.isMinimized() and ed not in self._editors_hidden_for_capture:
@@ -6656,6 +7492,12 @@ class MainWindow(QMainWindow):
             and self._floating_bar_was_visible_before_capture
         ):
             QTimer.singleShot(120, self.floating_bar.show)
+
+        if self._live_strip_hidden_for_capture:
+            self._live_strip_hidden_for_capture = False
+            strip = self._live_typing.strip
+            if strip is not None and self._live_typing.active:
+                strip.show()
 
         # The editors that were open before the capture, back where they were.
         hidden, self._editors_hidden_for_capture = self._editors_hidden_for_capture, []
