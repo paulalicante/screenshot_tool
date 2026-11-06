@@ -267,6 +267,28 @@ to open with that one, leaving the old one the way it was."*
   three editors, same-size and full-screen captures, cancel, edit-before-save), movetest, notetest
   and speechtest all pass. Backup: `screenshot_tool_pyqt.py.bak_pre_many_editors_2026_11_04`.
 
+## Closing an editor with unsaved changes asks first (2026-11-05)
+
+Paul: *"when I have an edit window open and I hit escape, it doesn't just close, but it tells me
+that it has unsaved changes and confirm the close ... Any type of attempt to close ... an edit
+window, I need to not just have it disappear."*
+- Esc, the ✕ Cancel button (both `_cancel`) and the window's own X / Alt+F4 / taskbar close
+  (`closeEvent`) all go through `ScreenshotEditor._ask_before_closing()`: a StyledDialog
+  "Unsaved changes" with **Save** (saves exactly as Enter does, then closes), **Discard** and
+  **Keep editing** (also Esc on the box). Enter still saves at once, no question.
+- "Unsaved" = `has_unsaved_changes()`: any object drawn (every drawing is an object; drawn then
+  undone is nothing), a stroke or drag in progress, or `capture_unsaved` — set on editors opened
+  BEFORE the capture is saved (Settings: edit before save), where closing loses the screenshot
+  itself, so they always ask. With nothing to lose the editor closes at once, as before.
+- In closeEvent, Save emits `editing_complete` with `_result_pixmap()` and lets the close go on
+  (calling `_save()` there would close inside a close); Keep editing = `event.ignore()`.
+- Not covered: killing the process (a restart, a crash) cannot ask.
+- Proof: closetest.py (scratchpad: all three ways × Keep / Esc on the box / Discard / Save, the
+  saved picture has the drawing, the wording for one and many drawings and for an unsaved capture,
+  and the real box's buttons clicked), functest3.py section 11 (Save from the question writes the
+  drawing into the file; Discard leaves it), and every earlier test. Backup:
+  `screenshot_tool_pyqt.py.bak_pre_confirm_close_2026_11_05`.
+
 ## Live voice typing in any text box (2026-11-04)
 
 Paul: *"any text box where I would normally type, I should be able to also use voice typing ...

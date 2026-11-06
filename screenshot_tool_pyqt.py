@@ -5226,8 +5226,39 @@ class ScreenshotEditor(QMainWindow):
 
     # ── save / cancel ────────────────────────────────────────────────────────
 
-    def _save(self):
-        if self._drag:      # Enter pressed mid-drag: drop the object where it is
+    # An editor opened before a capture is saved (Settings: edit before save) holds a capture that
+    # is not on disk yet: closing it loses the screenshot itself, so it always asks.
+    capture_unsaved = False
+
+    def has_unsaved_changes(self) -> bool:
+        """Anything a close would lose: something drawn (every drawing is an object; one undone
+        away is not), a stroke half drawn, or the capture itself when it is not saved yet."""
+        return bool(self._objects) or bool(self.drawing) or bool(self._drag) or self.capture_unsaved
+
+    def _ask_before_closing(self) -> str:
+        """'save', 'discard' or 'keep' (keep editing). Paul: Esc, Cancel or the window's X must
+        not just make an edit disappear."""
+        if not self.has_unsaved_changes():
+            return "discard"
+        if self.capture_unsaved and not self._objects:
+            msg = "This screenshot hasn't been saved yet."
+            sub = "Discard throws the screenshot away."
+        else:
+            n = len(self._objects)
+            what = "a drawing" if n <= 1 else f"{n} drawings"
+            verb = "isn't" if n <= 1 else "aren't"
+            msg = f"This screenshot has {what} that {verb} saved."
+            sub = ("Discard throws the screenshot away too: it is not saved yet."
+                   if self.capture_unsaved else
+                   f"Discard keeps the screenshot as it was, without {'it' if n <= 1 else 'them'}.")
+        self.raise_()
+        self.activateWindow()
+        answer = StyledDialog(self, "Unsaved changes", msg, sub=sub, buttons=[
+            ("Save", "primary"), ("Discard", "danger"), ("Keep editing", "secondary")]).exec()
+        return {"Save": "save", "Discard": "discard"}.get(answer, "keep")   # Esc in the box: keep
+
+    def _result_pixmap(self) -> QPixmap:
+        if self._drag:      # mid-drag: drop the object where it is
             self._drag = None
             self._above_pixmap = None
             self._render_overlay()
@@ -5236,20 +5267,39 @@ class ScreenshotEditor(QMainWindow):
         p.drawPixmap(0, 0, self.original_pixmap)
         p.drawPixmap(0, 0, self.overlay_pixmap)
         p.end()
+        return result
+
+    def _save(self):
+        result = self._result_pixmap()
         self._finished = True
         self.editing_complete.emit(result)
         self.close()
 
     def _cancel(self):
+        """Esc and the Cancel button: asks first when something would be lost."""
+        choice = self._ask_before_closing()
+        if choice == "keep":
+            return
+        if choice == "save":
+            self._save()
+            return
         self._finished = True
         self.editing_cancelled.emit()
         self.close()
 
     def closeEvent(self, event):
-        # The window's own X is a cancel too, or a caller waiting on the editor never hears back.
+        # The window's own X (or Alt+F4, or the taskbar) is a cancel too, and asks first the same
+        # way; a caller waiting on the editor always hears back.
         if not getattr(self, '_finished', False):
+            choice = self._ask_before_closing()
+            if choice == "keep":
+                event.ignore()
+                return
             self._finished = True
-            self.editing_cancelled.emit()
+            if choice == "save":
+                self.editing_complete.emit(self._result_pixmap())
+            else:
+                self.editing_cancelled.emit()
         super().closeEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent):
@@ -7539,6 +7589,7 @@ class MainWindow(QMainWindow):
             self.capture_in_progress = False
             self._restore_capture_ui()
             editor = ScreenshotEditor(pixmap)
+            editor.capture_unsaved = True      # closing it loses the capture: it asks first
             editor.editing_complete.connect(lambda p: self._save_screenshot(p, from_editor=True))
             editor.editing_cancelled.connect(self._edit_before_save_cancelled)
             self._open_editor(editor)
